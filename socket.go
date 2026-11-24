@@ -48,6 +48,8 @@ type socket struct {
 
 	handshakeTimeout time.Duration
 	maxRecvFrame     uint64
+	recvBufSize      int // SO_RCVBUF of new connections, 0 = OS default
+	sendBufSize      int // SO_SNDBUF of new connections, 0 = OS default
 	timeout          time.Duration
 
 	mu    sync.RWMutex
@@ -131,8 +133,8 @@ func (sck *socket) topics() []string {
 
 // Close closes the open Socket
 func (sck *socket) Close() error {
-	// The Lock around Signal ensures the connReaper is running
-	// and is in sck.reaperCond.Wait()
+	// Cancel under the reaper lock: a running reaper sees ctx done the next
+	// time it checks its wait condition.
 	sck.reaperCond.L.Lock()
 	sck.cancel()
 	sck.reaperCond.Signal()
@@ -209,12 +211,6 @@ func (sck *socket) Listen(endpoint string) error {
 	sck.listener = l
 
 	go sck.accept()
-	if !sck.reaperStarted {
-		sck.reaperCond.L.Lock()
-		go sck.connReaper()
-		sck.reaperStarted = true
-	}
-
 	return nil
 }
 
@@ -292,13 +288,26 @@ connect:
 		return fmt.Errorf("zmq4: got a nil ZMTP connection to %q", endpoint)
 	}
 
-	if !sck.reaperStarted {
-		sck.reaperCond.L.Lock()
-		go sck.connReaper()
-		sck.reaperStarted = true
-	}
 	sck.addConn(zconn)
 	return nil
+}
+
+// setBufferSizes applies WithRecvBufferSize/WithSendBufferSize to transports that support them (TCP).
+func (sck *socket) setBufferSizes(conn net.Conn) {
+	if sck.recvBufSize > 0 {
+		if c, ok := conn.(interface{ SetReadBuffer(int) error }); ok {
+			if err := c.SetReadBuffer(sck.recvBufSize); err != nil {
+				sck.log.Printf("could not set the receive buffer size of %q: %+v", sck.ep, err)
+			}
+		}
+	}
+	if sck.sendBufSize > 0 {
+		if c, ok := conn.(interface{ SetWriteBuffer(int) error }); ok {
+			if err := c.SetWriteBuffer(sck.sendBufSize); err != nil {
+				sck.log.Printf("could not set the send buffer size of %q: %+v", sck.ep, err)
+			}
+		}
+	}
 }
 
 // openConn performs the ZMTP handshake on conn. The handshake is bounded by the
@@ -306,6 +315,7 @@ connect:
 // the TCP connection but never sends its greeting would otherwise block forever.
 // conn is closed if the handshake fails.
 func (sck *socket) openConn(conn net.Conn, server bool) (*Conn, error) {
+	sck.setBufferSizes(conn)
 	if sck.handshakeTimeout > 0 {
 		_ = conn.SetDeadline(time.Now().Add(sck.handshakeTimeout))
 	}
@@ -380,6 +390,12 @@ func (sck *socket) rmConn(c *Conn) {
 func (sck *socket) scheduleRmConn(c *Conn) {
 	sck.reaperCond.L.Lock()
 	sck.closedConns = append(sck.closedConns, c)
+	// The reaper starts with the first closed connection: a socket whose
+	// connections stay up never pays for an idle goroutine.
+	if !sck.reaperStarted && sck.ctx.Err() == nil {
+		sck.reaperStarted = true
+		go sck.connReaper()
+	}
 	sck.reaperCond.Signal()
 	sck.reaperCond.L.Unlock()
 
@@ -423,11 +439,9 @@ func (sck *socket) Timeout() time.Duration {
 }
 
 func (sck *socket) connReaper() {
-	// We are not locking here sck.reaperCond.L.Lock()
-	// as it should be locked prior starting connReaper as goroutine
-	// That would ensure that sck.reaperCond.Signal()
-	// would be delivered only when reaper goroutine is really started
-	// and is in sck.reaperCond.Wait()
+	// The wait condition is checked under the lock, so a Signal sent before
+	// this goroutine reaches Wait (by scheduleRmConn or Close) is not lost.
+	sck.reaperCond.L.Lock()
 	defer sck.reaperCond.L.Unlock()
 
 	for {

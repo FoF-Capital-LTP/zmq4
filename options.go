@@ -119,18 +119,28 @@ func WithAutomaticReconnect(automaticReconnect bool) Option {
 	}
 }
 
+// WithRecvBufferSize sets the kernel receive buffer (SO_RCVBUF) of the
+// socket's TCP connections, like libzmq's ZMQ_RCVBUF. On Linux an explicit
+// size turns off receive buffer auto-tuning and is capped by net.core.rmem_max.
+// 0 keeps the OS default.
+func WithRecvBufferSize(size int) Option {
+	return func(s *socket) {
+		s.recvBufSize = size
+	}
+}
+
+// WithSendBufferSize sets the kernel send buffer (SO_SNDBUF) of the socket's
+// TCP connections, like libzmq's ZMQ_SNDBUF. 0 keeps the OS default.
+func WithSendBufferSize(size int) Option {
+	return func(s *socket) {
+		s.sendBufSize = size
+	}
+}
+
 /*
 // TODO(sbinet)
 
 func WithIOThreads(threads int) Option {
-	return nil
-}
-
-func WithSendBufferSize(size int) Option {
-	return nil
-}
-
-func WithRecvBufferSize(size int) Option {
 	return nil
 }
 */
