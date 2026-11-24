@@ -66,7 +66,7 @@ func WithDialerMaxRetries(maxRetries int) Option {
 	}
 }
 
-// WithInlineRecv configures a SUB socket to read messages directly in the
+// WithInlineRecv configures a SUB or DEALER socket to read messages directly in the
 // goroutine calling Recv, instead of through a per-connection reader goroutine
 // and a channel. This removes one goroutine hand-off per message (lower
 // latency and CPU) and leaves no goroutine behind on Close.
@@ -81,7 +81,7 @@ func WithInlineRecv() Option {
 	}
 }
 
-// WithZeroCopyRecv makes Recv on a WithInlineRecv SUB socket allocate nothing:
+// WithZeroCopyRecv makes Recv on a WithInlineRecv SUB or DEALER socket allocate nothing:
 // the frames of the returned message point into buffers owned by the socket and
 // are only valid until the next call to Recv. Copy whatever must outlive it.
 // It applies to the NULL security mechanism; other mechanisms keep allocating.

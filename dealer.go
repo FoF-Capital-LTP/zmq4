@@ -13,6 +13,9 @@ import (
 // The returned socket value is initially unbound.
 func NewDealer(ctx context.Context, opts ...Option) Socket {
 	dealer := &dealerSocket{newSocket(ctx, Dealer, opts...)}
+	if dealer.sck.inlineRecv {
+		dealer.sck.r = newInlineReader(dealer.sck.ctx, dealer.sck.zeroCopyRecv)
+	}
 	return dealer
 }
 

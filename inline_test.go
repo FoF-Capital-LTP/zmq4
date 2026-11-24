@@ -357,3 +357,61 @@ func TestInlineZeroCopyRecvFrames(t *testing.T) {
 		}
 	}
 }
+
+// A WithInlineRecv DEALER talks to a ROUTER; Send may run concurrently with a blocked Recv.
+func TestInlineDealerRoundTrip(t *testing.T) {
+	ep := must(EndPoint("tcp"))
+	router := NewRouter(context.Background(), WithID(SocketIdentity("router")))
+	defer router.Close()
+	if err := router.Listen(ep); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			msg, err := router.Recv()
+			if err != nil {
+				return
+			}
+			// [identity][payload] -> echo back with a suffix
+			reply := NewMsgFrom(msg.Frames[0], append(append([]byte{}, msg.Frames[len(msg.Frames)-1]...), "-ok"...))
+			if err := router.Send(reply); err != nil {
+				return
+			}
+		}
+	}()
+	dealer := NewDealer(context.Background(), WithInlineRecv())
+	defer dealer.Close()
+	if err := dealer.Dial(ep); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan string, 100)
+	go func() {
+		for {
+			msg, err := dealer.Recv()
+			if err != nil {
+				return
+			}
+			got <- string(msg.Frames[len(msg.Frames)-1])
+		}
+	}()
+	const n = 50
+	for i := 0; i < n; i++ {
+		if err := dealer.Send(NewMsgString(fmt.Sprintf("req%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seen := map[string]bool{}
+	for i := 0; i < n; i++ {
+		select {
+		case s := <-got:
+			seen[s] = true
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d replies", i)
+		}
+	}
+	for i := 0; i < n; i++ {
+		if !seen[fmt.Sprintf("req%d-ok", i)] {
+			t.Fatalf("missing reply %d", i)
+		}
+	}
+}
