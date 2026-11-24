@@ -37,7 +37,10 @@ func TestSubCloseUnderTrafficNoLeak(t *testing.T) {
 		{"inline", []zmq4.Option{zmq4.WithInlineRecv()}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			defer goleak.VerifyNone(t)
+			// Only the SUB side is under test: the Go PUB used as the peer keeps its own writer goroutines.
+			defer goleak.VerifyNone(t,
+				goleak.IgnoreAnyFunction("github.com/go-zeromq/zmq4.(*pubMWriter).run"),
+				goleak.IgnoreAnyFunction("github.com/go-zeromq/zmq4.(*pubMWriter).addConn.func1"))
 
 			ep := freeTCPEndpoint(t)
 			pctx, pcancel := context.WithCancel(context.Background())
