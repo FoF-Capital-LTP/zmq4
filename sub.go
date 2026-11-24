@@ -16,7 +16,7 @@ import (
 func NewSub(ctx context.Context, opts ...Option) Socket {
 	sub := &subSocket{sck: newSocket(ctx, Sub, opts...)}
 	if sub.sck.inlineRecv {
-		sub.sck.r = newInlineReader(sub.sck.ctx)
+		sub.sck.r = newInlineReader(sub.sck.ctx, sub.sck.zeroCopyRecv)
 	} else {
 		sub.sck.r = newQReader(sub.sck.ctx)
 	}

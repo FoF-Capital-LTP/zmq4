@@ -5,6 +5,7 @@
 package zmq4
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -249,5 +250,99 @@ func TestInlineRecvHandlesPing(t *testing.T) {
 	}
 	if msg.Type != UsrMsg {
 		t.Fatal("command delivered as a message")
+	}
+}
+
+// zeroCopyPeer accepts the SUB of a WithInlineRecv+WithZeroCopyRecv socket and returns the
+// server side of the ZMTP connection, so the test can write exact frames.
+func zeroCopyPeer(t *testing.T) (Socket, *Conn) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	srv := make(chan *Conn, 1)
+	go func() {
+		raw, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c, err := Open(raw, nullSecurity{}, Pub, SocketIdentity("pub"), true, nil)
+		if err != nil {
+			return
+		}
+		srv <- c
+	}()
+	sub := NewSub(context.Background(), WithInlineRecv(), WithZeroCopyRecv())
+	t.Cleanup(func() { sub.Close() })
+	if err := sub.SetOption(OptionSubscribe, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := sub.Dial("tcp://" + l.Addr().String()); err != nil {
+		t.Fatal(err)
+	}
+	var c *Conn
+	select {
+	case c = <-srv:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no connection")
+	}
+	t.Cleanup(func() { c.Close() })
+	if msg := c.read(); msg.err != nil { // the subscription
+		t.Fatal(msg.err)
+	}
+	return sub, c
+}
+
+func patterned(n, seed int) []byte {
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = byte(i*7 + seed)
+	}
+	return b
+}
+
+// Frames of every size class, single- and multi-frame messages, with commands in between:
+// each message must read back exactly, including frames larger than the read buffer.
+func TestInlineZeroCopyRecvFrames(t *testing.T) {
+	sub, c := zeroCopyPeer(t)
+	sizes := []int{0, 1, 255, 256, 400, connReadBufSize - 1, connReadBufSize, connReadBufSize + 1, 1 << 20}
+	var want [][][]byte
+	for i, n := range sizes {
+		want = append(want, [][]byte{patterned(n, i)})
+	}
+	want = append(want,
+		[][]byte{patterned(10, 1), patterned(400, 2)},
+		[][]byte{patterned(connReadBufSize+5, 3), patterned(7, 4), patterned(connReadBufSize+9, 5)},
+		[][]byte{patterned(0, 6), patterned(300, 7)},
+	)
+	// many small messages after the large ones: the read buffer has to refill and move
+	for i := 0; i < 2000; i++ {
+		want = append(want, [][]byte{patterned(100+i%400, i)})
+	}
+	go func() {
+		for i, frames := range want {
+			if i%97 == 0 {
+				_ = c.SendCmd(CmdPing, []byte{0, 1})
+			}
+			if err := c.SendMsg(NewMsgFrom(frames...)); err != nil {
+				return
+			}
+		}
+	}()
+	for i, frames := range want {
+		msg, err := sub.Recv()
+		if err != nil {
+			t.Fatalf("message %d: %v", i, err)
+		}
+		if len(msg.Frames) != len(frames) {
+			t.Fatalf("message %d: %d frames, want %d", i, len(msg.Frames), len(frames))
+		}
+		for j := range frames {
+			if !bytes.Equal(msg.Frames[j], frames[j]) {
+				t.Fatalf("message %d frame %d (%d bytes): content differs", i, j, len(frames[j]))
+			}
+		}
 	}
 }

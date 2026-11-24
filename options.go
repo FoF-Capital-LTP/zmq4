@@ -81,6 +81,16 @@ func WithInlineRecv() Option {
 	}
 }
 
+// WithZeroCopyRecv makes Recv on a WithInlineRecv SUB socket allocate nothing:
+// the frames of the returned message point into buffers owned by the socket and
+// are only valid until the next call to Recv. Copy whatever must outlive it.
+// It applies to the NULL security mechanism; other mechanisms keep allocating.
+func WithZeroCopyRecv() Option {
+	return func(s *socket) {
+		s.zeroCopyRecv = true
+	}
+}
+
 // WithAutomaticReconnect allows to configure a socket to automatically
 // reconnect on connection loss.
 func WithAutomaticReconnect(automaticReconnect bool) Option {

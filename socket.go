@@ -41,6 +41,7 @@ type socket struct {
 	subTopics     func() []string
 	autoReconnect bool
 	inlineRecv    bool
+	zeroCopyRecv  bool
 	timeout       time.Duration
 
 	mu    sync.RWMutex
@@ -171,6 +172,9 @@ func (sck *socket) SendMulti(msg Msg) error {
 
 // Recv receives a complete message.
 func (sck *socket) Recv() (Msg, error) {
+	if q, ok := sck.r.(*inlineReader); ok {
+		return q.recv(sck.ctx)
+	}
 	var msg Msg
 	err := sck.r.read(sck.ctx, &msg)
 	return msg, err

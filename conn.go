@@ -34,14 +34,18 @@ func (c *Conn) reader() io.Reader {
 // Conn implements the ZeroMQ Message Transport Protocol as defined
 // in https://rfc.zeromq.org/spec:23/ZMTP/.
 type Conn struct {
-	typ    SocketType
-	id     SocketIdentity
-	rw     net.Conn
-	r      *bufio.Reader // all reads go through r, so one syscall can fetch many frames
-	sec    Security
-	Server bool
-	Meta   Metadata
-	Peer   struct {
+	typ SocketType
+	id  SocketIdentity
+	rw  net.Conn
+	r   *bufio.Reader // all reads go through r, so one syscall can fetch many frames
+	// frame header scratch: a local array passed to io.ReadFull escapes to the heap on every frame.
+	// A connection has a single reader at a time, so a field is enough.
+	hdr     [2]byte
+	longHdr [8]byte
+	sec     Security
+	Server  bool
+	Meta    Metadata
+	Peer    struct {
 		Server bool
 		Meta   Metadata
 	}
@@ -384,49 +388,20 @@ func (c *Conn) send(isCommand bool, body []byte, flag byte) error {
 // read returns the isCommand flag, the body of the message, and optionally an error
 func (c *Conn) read() Msg {
 	var (
-		header  [2]byte
-		longHdr [8]byte
-		msg     Msg
+		msg Msg
 
 		hasMore = true
 		isCmd   = false
 	)
 
 	for hasMore {
-
-		// Read out the header
-		_, msg.err = io.ReadFull(c.reader(), header[:])
-		if msg.err != nil {
-			c.checkIO(msg.err)
+		fl, size, err := c.readFrameHeader()
+		if err != nil {
+			msg.err = err
 			return msg
 		}
-
-		fl := flag(header[0])
-
 		hasMore = fl.hasMore()
 		isCmd = isCmd || fl.isCommand()
-
-		// Determine the actual length of the body
-		size := uint64(header[1])
-		if fl.isLong() {
-			// We read 2 bytes of the header already
-			// In case of a long message, the length is bytes 2-8 of the header
-			// We already have the first byte, so assign it, and then read the rest
-			longHdr[0] = header[1]
-
-			_, msg.err = io.ReadFull(c.reader(), longHdr[1:])
-			if msg.err != nil {
-				c.checkIO(msg.err)
-				return msg
-			}
-
-			size = binary.BigEndian.Uint64(longHdr[:])
-		}
-
-		if size > uint64(maxInt64) {
-			msg.err = errOverflow
-			return msg
-		}
 
 		body := make([]byte, size)
 		_, msg.err = io.ReadFull(c.reader(), body)
@@ -452,6 +427,80 @@ func (c *Conn) read() Msg {
 		msg.Type = CmdMsg
 	}
 	return msg
+}
+
+// readFrameHeader reads the flags and the body size of the next frame.
+func (c *Conn) readFrameHeader() (flag, uint64, error) {
+	if _, err := io.ReadFull(c.reader(), c.hdr[:]); err != nil {
+		c.checkIO(err)
+		return 0, 0, err
+	}
+	fl := flag(c.hdr[0])
+	size := uint64(c.hdr[1])
+	if fl.isLong() {
+		// The 2 bytes read so far hold the flags and the first byte of the 8-byte length.
+		c.longHdr[0] = c.hdr[1]
+		if _, err := io.ReadFull(c.reader(), c.longHdr[1:]); err != nil {
+			c.checkIO(err)
+			return 0, 0, err
+		}
+		size = binary.BigEndian.Uint64(c.longHdr[:])
+	}
+	if size > uint64(maxInt64) {
+		return 0, 0, errOverflow
+	}
+	return fl, size, nil
+}
+
+// readBorrowed reads a message like read, without allocating: the last frame
+// points into the connection's read buffer when it fits there, the others are
+// copied into scratch. Frames are only valid until the next read on c.
+// frames and scratch are reused; the grown scratch is returned.
+// It needs the NULL security mechanism and a buffered connection.
+func (c *Conn) readBorrowed(frames [][]byte, scratch []byte) (Msg, []byte) {
+	msg := Msg{Frames: frames[:0]}
+	scratch = scratch[:0]
+	isCmd := false
+	for hasMore := true; hasMore; {
+		fl, size, err := c.readFrameHeader()
+		if err != nil {
+			msg.err = err
+			return msg, scratch
+		}
+		hasMore = fl.hasMore()
+		isCmd = isCmd || fl.isCommand()
+
+		n := int(size)
+		var body []byte
+		if !hasMore && n <= c.r.Size() {
+			// Nothing else is read from c before the caller is done with the message,
+			// so the buffered bytes stay put.
+			if body, err = c.r.Peek(n); err == nil {
+				_, err = c.r.Discard(n)
+			}
+		} else {
+			off := len(scratch)
+			if cap(scratch)-off < n {
+				grown := make([]byte, off, off+n+off)
+				copy(grown, scratch)
+				// frames already in the old scratch stay valid: they keep the old array alive
+				scratch = grown
+			}
+			scratch = scratch[:off+n]
+			body = scratch[off : off+n : off+n]
+			_, err = io.ReadFull(c.r, body)
+		}
+		if err != nil {
+			c.checkIO(err)
+			msg.err = err
+			return msg, scratch
+		}
+		msg.Frames = append(msg.Frames, body)
+	}
+	if isCmd {
+		msg.Type = CmdMsg
+	}
+	return msg, scratch
 }
 
 func (conn *Conn) subscribe(msg Msg) {

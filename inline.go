@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // inlineReader reads messages in the goroutine calling Recv, straight from the
@@ -21,17 +22,23 @@ type inlineReader struct {
 
 	recvMu sync.Mutex // serializes Recv callers
 
-	mu     sync.Mutex
-	conn   *Conn
+	mu     sync.Mutex // serializes connection changes
+	conn   atomic.Pointer[Conn]
 	notify chan struct{} // signaled when a connection is added
+
+	// zero-copy receive (WithZeroCopyRecv): reused across Recv calls, guarded by recvMu
+	zeroCopy bool
+	frames   [][]byte
+	scratch  []byte
 
 	stop func() bool
 }
 
-func newInlineReader(ctx context.Context) *inlineReader {
+func newInlineReader(ctx context.Context, zeroCopy bool) *inlineReader {
 	q := &inlineReader{
-		ctx:    ctx,
-		notify: make(chan struct{}, 1),
+		ctx:      ctx,
+		notify:   make(chan struct{}, 1),
+		zeroCopy: zeroCopy,
 	}
 	// A blocked read is not interrupted by the context: close the connection
 	// so that Recv returns as soon as the socket is closed or ctx is canceled.
@@ -44,16 +51,13 @@ func newInlineReader(ctx context.Context) *inlineReader {
 }
 
 func (q *inlineReader) current() *Conn {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	return q.conn
+	return q.conn.Load()
 }
 
 func (q *inlineReader) Close() error {
 	q.stop()
 	q.mu.Lock()
-	c := q.conn
-	q.conn = nil
+	c := q.conn.Swap(nil)
 	q.mu.Unlock()
 	if c != nil {
 		return c.Close()
@@ -63,8 +67,7 @@ func (q *inlineReader) Close() error {
 
 func (q *inlineReader) addConn(c *Conn) {
 	q.mu.Lock()
-	old := q.conn
-	q.conn = c
+	old := q.conn.Swap(c)
 	q.mu.Unlock()
 	if old != nil && old != c {
 		_ = old.Close()
@@ -80,9 +83,7 @@ func (q *inlineReader) addConn(c *Conn) {
 
 func (q *inlineReader) rmConn(c *Conn) {
 	q.mu.Lock()
-	if q.conn == c {
-		q.conn = nil
-	}
+	q.conn.CompareAndSwap(c, nil)
 	q.mu.Unlock()
 }
 
@@ -104,33 +105,44 @@ func (q *inlineReader) wait(ctx context.Context) (*Conn, error) {
 }
 
 func (q *inlineReader) read(ctx context.Context, msg *Msg) error {
+	m, err := q.recv(ctx)
+	*msg = m
+	return err
+}
+
+// recv returns the message by value: socket.Recv calls it directly, so the
+// message does not escape to the heap through the rpool interface.
+func (q *inlineReader) recv(ctx context.Context) (Msg, error) {
 	q.recvMu.Lock()
 	defer q.recvMu.Unlock()
 	for {
 		c, err := q.wait(ctx)
 		if err != nil {
-			return err
+			return Msg{}, err
 		}
-		m := c.read()
+		var m Msg
+		if q.zeroCopy && c.r != nil && c.sec.Type() == NullSecurity {
+			m, q.scratch = c.readBorrowed(q.frames, q.scratch)
+			q.frames = m.Frames
+		} else {
+			m = c.read()
+		}
 		if m.err != nil {
 			q.rmConn(c)
 			if err := ctx.Err(); err != nil {
-				return err
+				return Msg{}, err
 			}
-			*msg = m
-			return m.err
+			return m, m.err
 		}
 		if m.isCmd() {
 			if err := q.handleCmd(c, m); err != nil {
 				q.rmConn(c)
 				_ = c.Close()
-				*msg = Msg{err: err}
-				return err
+				return Msg{err: err}, err
 			}
 			continue
 		}
-		*msg = m
-		return nil
+		return m, nil
 	}
 }
 
