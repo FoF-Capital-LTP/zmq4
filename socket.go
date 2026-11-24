@@ -18,9 +18,12 @@ import (
 )
 
 const (
-	defaultRetry      = 250 * time.Millisecond
-	defaultTimeout    = 5 * time.Minute
-	defaultMaxRetries = 10
+	defaultRetry   = 250 * time.Millisecond
+	defaultTimeout = 5 * time.Minute
+
+	// defaultHandshakeTimeout bounds the ZMTP greeting and handshake, like libzmq's ZMQ_HANDSHAKE_IVL.
+	defaultHandshakeTimeout = 30 * time.Second
+	defaultMaxRetries       = 10
 )
 
 var (
@@ -42,7 +45,10 @@ type socket struct {
 	autoReconnect bool
 	inlineRecv    bool
 	zeroCopyRecv  bool
-	timeout       time.Duration
+
+	handshakeTimeout time.Duration
+	maxRecvFrame     uint64
+	timeout          time.Duration
 
 	mu    sync.RWMutex
 	conns []*Conn // ZMTP connections
@@ -71,15 +77,18 @@ func newDefaultSocket(ctx context.Context, sockType SocketType) *socket {
 		retry:      defaultRetry,
 		maxRetries: defaultMaxRetries,
 		timeout:    defaultTimeout,
-		sec:        nullSecurity{},
-		conns:      nil,
-		r:          newQReader(ctx),
-		w:          newMWriter(ctx),
-		props:      make(map[string]interface{}),
-		ctx:        ctx,
-		cancel:     cancel,
-		dialer:     net.Dialer{Timeout: defaultTimeout},
-		reaperCond: sync.NewCond(&sync.Mutex{}),
+
+		handshakeTimeout: defaultHandshakeTimeout,
+		maxRecvFrame:     defaultMaxRecvFrameSize,
+		sec:              nullSecurity{},
+		conns:            nil,
+		r:                newQReader(ctx),
+		w:                newMWriter(ctx),
+		props:            make(map[string]interface{}),
+		ctx:              ctx,
+		cancel:           cancel,
+		dialer:           net.Dialer{Timeout: defaultTimeout},
+		reaperCond:       sync.NewCond(&sync.Mutex{}),
 	}
 }
 
@@ -224,7 +233,7 @@ func (sck *socket) accept() {
 				continue
 			}
 
-			zconn, err := Open(conn, sck.sec, sck.typ, sck.id, true, sck.scheduleRmConn)
+			zconn, err := sck.openConn(conn, true)
 			if err != nil {
 				// FIXME(sbinet): maybe bubble up this error to application code?
 				sck.log.Printf("could not open a ZMTP connection with %q: %+v", sck.ep, err)
@@ -275,7 +284,7 @@ connect:
 		return fmt.Errorf("zmq4: got a nil dial-conn to %q", endpoint)
 	}
 
-	zconn, err := Open(conn, sck.sec, sck.typ, sck.id, false, sck.scheduleRmConn)
+	zconn, err := sck.openConn(conn, false)
 	if err != nil {
 		return fmt.Errorf("zmq4: could not open a ZMTP connection: %w", err)
 	}
@@ -290,6 +299,31 @@ connect:
 	}
 	sck.addConn(zconn)
 	return nil
+}
+
+// openConn performs the ZMTP handshake on conn. The handshake is bounded by the
+// handshake timeout and aborted when the socket is closed: a peer that accepts
+// the TCP connection but never sends its greeting would otherwise block forever.
+// conn is closed if the handshake fails.
+func (sck *socket) openConn(conn net.Conn, server bool) (*Conn, error) {
+	if sck.handshakeTimeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(sck.handshakeTimeout))
+	}
+	stop := context.AfterFunc(sck.ctx, func() {
+		_ = conn.SetDeadline(time.Unix(1, 0))
+	})
+	zconn, err := Open(conn, sck.sec, sck.typ, sck.id, server, sck.scheduleRmConn)
+	if !stop() && err == nil {
+		// the socket was closed while (or right after) handshaking: the deadline is in the past
+		err = sck.ctx.Err()
+	}
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	_ = conn.SetDeadline(time.Time{})
+	zconn.maxRecvFrame = sck.maxRecvFrame
+	return zconn, nil
 }
 
 func (sck *socket) addConn(c *Conn) {

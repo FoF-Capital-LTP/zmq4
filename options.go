@@ -91,6 +91,26 @@ func WithZeroCopyRecv() Option {
 	}
 }
 
+// WithHandshakeTimeout bounds the ZMTP greeting and security handshake of each
+// new connection (30s by default, like libzmq's ZMQ_HANDSHAKE_IVL).
+// A connection that does not complete it in time is closed. 0 disables the limit.
+func WithHandshakeTimeout(d time.Duration) Option {
+	return func(s *socket) {
+		s.handshakeTimeout = d
+	}
+}
+
+// WithMaxRecvFrameSize caps the size of a received frame (256MiB by default).
+// A larger frame, typically a corrupted length field, fails the connection
+// instead of allocating that much memory.
+func WithMaxRecvFrameSize(n int64) Option {
+	return func(s *socket) {
+		if n > 0 {
+			s.maxRecvFrame = uint64(n)
+		}
+	}
+}
+
 // WithAutomaticReconnect allows to configure a socket to automatically
 // reconnect on connection loss.
 func WithAutomaticReconnect(automaticReconnect bool) Option {

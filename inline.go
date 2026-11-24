@@ -121,6 +121,10 @@ func (q *inlineReader) recv(ctx context.Context) (Msg, error) {
 			return Msg{}, err
 		}
 		var m Msg
+		if cap(q.scratch) > maxRetainedScratch {
+			// frames of the previous message are no longer valid: give back what a big message grew
+			q.scratch = nil
+		}
 		if q.zeroCopy && c.r != nil && c.sec.Type() == NullSecurity {
 			m, q.scratch = c.readBorrowed(q.frames, q.scratch)
 			q.frames = m.Frames
@@ -160,5 +164,8 @@ func (q *inlineReader) handleCmd(c *Conn, m Msg) error {
 	}
 	return nil
 }
+
+// maxRetainedScratch is the largest scratch buffer kept between messages.
+const maxRetainedScratch = 1 << 20
 
 var _ rpool = (*inlineReader)(nil)

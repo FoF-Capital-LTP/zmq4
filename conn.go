@@ -22,6 +22,11 @@ var ErrClosedConn = errors.New("zmq4: read/write on closed connection")
 // connReadBufSize is the size of the per-connection read buffer.
 const connReadBufSize = 32 << 10
 
+// defaultMaxRecvFrameSize is the largest frame accepted unless WithMaxRecvFrameSize says otherwise.
+const defaultMaxRecvFrameSize = 256 << 20
+
+var errFrameTooLarge = errors.New("zmq4: frame larger than the maximum receive size")
+
 // reader returns the buffered reader of the connection.
 // Conns built without Open (tests) fall back to the raw connection.
 func (c *Conn) reader() io.Reader {
@@ -42,10 +47,12 @@ type Conn struct {
 	// A connection has a single reader at a time, so a field is enough.
 	hdr     [2]byte
 	longHdr [8]byte
-	sec     Security
-	Server  bool
-	Meta    Metadata
-	Peer    struct {
+
+	maxRecvFrame uint64 // 0 means defaultMaxRecvFrameSize
+	sec          Security
+	Server       bool
+	Meta         Metadata
+	Peer         struct {
 		Server bool
 		Meta   Metadata
 	}
@@ -448,6 +455,13 @@ func (c *Conn) readFrameHeader() (flag, uint64, error) {
 	}
 	if size > uint64(maxInt64) {
 		return 0, 0, errOverflow
+	}
+	limit := c.maxRecvFrame
+	if limit == 0 {
+		limit = defaultMaxRecvFrameSize
+	}
+	if size > limit {
+		return 0, 0, errFrameTooLarge
 	}
 	return fl, size, nil
 }

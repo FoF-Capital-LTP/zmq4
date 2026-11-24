@@ -257,6 +257,17 @@ func TestInlineRecvHandlesPing(t *testing.T) {
 // server side of the ZMTP connection, so the test can write exact frames.
 func zeroCopyPeer(t *testing.T) (Socket, *Conn) {
 	t.Helper()
+	return subPeer(t, WithInlineRecv(), WithZeroCopyRecv())
+}
+
+// inlinePeer is zeroCopyPeer without zero-copy: Recv allocates every frame.
+func inlinePeer(t *testing.T) (Socket, *Conn) {
+	t.Helper()
+	return subPeer(t, WithInlineRecv())
+}
+
+func subPeer(t *testing.T, opts ...Option) (Socket, *Conn) {
+	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -274,7 +285,7 @@ func zeroCopyPeer(t *testing.T) (Socket, *Conn) {
 		}
 		srv <- c
 	}()
-	sub := NewSub(context.Background(), WithInlineRecv(), WithZeroCopyRecv())
+	sub := NewSub(context.Background(), opts...)
 	t.Cleanup(func() { sub.Close() })
 	if err := sub.SetOption(OptionSubscribe, ""); err != nil {
 		t.Fatal(err)
