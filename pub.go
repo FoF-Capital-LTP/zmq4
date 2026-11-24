@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -26,8 +27,9 @@ type Topics interface {
 // The returned socket value is initially unbound.
 func NewPub(ctx context.Context, opts ...Option) Socket {
 	pub := &pubSocket{sck: newSocket(ctx, Pub, opts...)}
-	pub.sck.w = newPubMWriter(pub.sck.ctx)
-	pub.sck.r = newPubQReader(pub.sck.ctx)
+	w, r := newPubMWriter(pub.sck.ctx), newPubQReader(pub.sck.ctx)
+	r.onSubscribe = w.reindex
+	pub.sck.w, pub.sck.r = w, r
 	return pub
 }
 
@@ -60,6 +62,13 @@ func (pub *pubSocket) SendMulti(msg Msg) error {
 }
 
 // Recv receives a complete message.
+// SendBatch queues msgs and then wakes each subscriber once, so a burst goes
+// out in one write per subscriber instead of one per message. It never blocks:
+// a subscriber at its high-water mark drops what does not fit.
+func (pub *pubSocket) SendBatch(msgs []Msg) error {
+	return pub.sck.w.(*pubMWriter).writeBatch(pub.sck.ctx, msgs)
+}
+
 func (*pubSocket) Recv() (Msg, error) {
 	msg := Msg{err: fmt.Errorf("zmq4: PUB sockets can't recv messages")}
 	return msg, msg.err
@@ -120,6 +129,8 @@ func (pub *pubSocket) Topics() []string {
 // pubQReader is a queued-message reader.
 type pubQReader struct {
 	ctx context.Context
+
+	onSubscribe func() // called after a peer's subscriptions changed
 
 	mu sync.RWMutex
 	rs []*Conn
@@ -200,6 +211,9 @@ func (q *pubQReader) listen(ctx context.Context, r *Conn) {
 			switch {
 			case q.topic(msg):
 				r.subscribe(msg)
+				if q.onSubscribe != nil {
+					q.onSubscribe()
+				}
 			default:
 				select {
 				case q.c <- msg:
@@ -223,20 +237,39 @@ func (q *pubQReader) topic(msg Msg) bool {
 	return topic == 0 || topic == 1
 }
 
-type pubMWriter struct {
-	ctx         context.Context
-	mu          sync.RWMutex
-	subscribers map[*Conn]chan Msg
+// pubPeer is one subscriber connection of a PUB.
+type pubPeer struct {
+	*connQueue
+	lastMsg  atomic.Uint64 // last message enqueued: a peer matching through several prefixes gets it once
+	lastCall atomic.Uint64 // last write call that enqueued here: wake each peer once per call
+}
 
+// pubIndex maps every subscribed prefix to the peers holding it. Matching a
+// message is one lookup per distinct prefix length, whatever the peer count.
+type pubIndex struct {
+	lens  []int
+	peers map[string][]*pubPeer
+}
+
+type pubMWriter struct {
+	ctx context.Context
+
+	mu     sync.Mutex // guards peers and closed; serializes reindex
+	peers  map[*Conn]*pubPeer
+	closed bool // after Close, a connection still finishing its handshake is not taken on
+	index  atomic.Pointer[pubIndex]
+
+	seq atomic.Uint64 // message and call stamps
 	hwm atomic.Int64
 }
 
 func newPubMWriter(ctx context.Context) *pubMWriter {
 	p := &pubMWriter{
-		ctx:         ctx,
-		subscribers: map[*Conn]chan Msg{},
+		ctx:   ctx,
+		peers: map[*Conn]*pubPeer{},
 	}
 	p.hwm.Store(DefaultSendHwm)
+	p.index.Store(&pubIndex{})
 	return p
 }
 
@@ -244,88 +277,108 @@ func (w *pubMWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	for conn, channel := range w.subscribers {
+	w.closed = true
+	for conn, p := range w.peers {
 		_ = conn.Close()
-		close(channel)
+		p.stop()
 	}
-	w.subscribers = nil
+	w.peers = map[*Conn]*pubPeer{}
+	w.index.Store(&pubIndex{})
 	return nil
 }
 
-// pubBatch is the most messages a subscriber's writer puts in one write.
-const pubBatch = 64
-
-func (mw *pubMWriter) addConn(w *Conn) {
-	mw.mu.Lock()
-	defer mw.mu.Unlock()
-
-	c := make(chan Msg, mw.hwm.Load())
-	mw.subscribers[w] = c
-	go func() {
-		// Messages are filtered by write, so everything queued is for this peer.
-		// Drain what is queued into one write, as libzmq batches its encoder output.
-		batch := make([]Msg, 0, pubBatch)
-		for {
-			msg, ok := <-c
-			if !ok {
-				return
-			}
-			batch = append(batch[:0], msg)
-		fill:
-			for len(batch) < pubBatch {
-				select {
-				case m, ok := <-c:
-					if !ok {
-						break fill
-					}
-					batch = append(batch, m)
-				default:
-					break fill
-				}
-			}
-			if w.sec.Type() == NullSecurity {
-				_ = w.sendBatch(batch)
-			} else {
-				for _, m := range batch {
-					_ = w.SendMsg(m)
-				}
-			}
-			clear(batch)
-		}
-	}()
+func (w *pubMWriter) addConn(c *Conn) {
+	p := &pubPeer{connQueue: newConnQueue(w.ctx, c)}
+	w.mu.Lock()
+	if w.closed {
+		w.mu.Unlock()
+		_ = c.Close()
+		return
+	}
+	w.peers[c] = p
+	w.reindexLocked()
+	w.mu.Unlock()
+	go p.run()
 }
 
-func (mw *pubMWriter) rmConn(w *Conn) {
-	mw.mu.Lock()
-	defer mw.mu.Unlock()
+func (w *pubMWriter) rmConn(c *Conn) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-	if channel, ok := mw.subscribers[w]; ok {
-		_ = w.Close()
-		delete(mw.subscribers, w)
-		close(channel)
+	if p, ok := w.peers[c]; ok {
+		_ = c.Close()
+		delete(w.peers, c)
+		p.stop()
+		w.reindexLocked()
 	}
+}
+
+// reindex rebuilds the prefix index after a peer's subscriptions changed.
+func (w *pubMWriter) reindex() {
+	w.mu.Lock()
+	w.reindexLocked()
+	w.mu.Unlock()
+}
+
+func (w *pubMWriter) reindexLocked() {
+	idx := &pubIndex{peers: map[string][]*pubPeer{}}
+	for c, p := range w.peers {
+		c.mu.RLock()
+		for t := range c.topics {
+			if _, seen := idx.peers[t]; !seen && !slices.Contains(idx.lens, len(t)) {
+				idx.lens = append(idx.lens, len(t))
+			}
+			idx.peers[t] = append(idx.peers[t], p)
+		}
+		c.mu.RUnlock()
+	}
+	w.index.Store(idx)
 }
 
 func (w *pubMWriter) write(ctx context.Context, msg Msg) error {
-	w.mu.RLock()
-	defer w.mu.RUnlock()
+	msgs := [1]Msg{msg}
+	return w.writeBatch(ctx, msgs[:])
+}
 
-	if len(msg.Frames) == 0 {
+// writeBatch queues each message for the peers subscribed to its topic, then
+// wakes each of those peers once. A peer whose queue already holds hwm messages
+// drops new ones, as libzmq's PUB does at its high-water mark; only messages the
+// peer subscribed to count against it.
+func (w *pubMWriter) writeBatch(ctx context.Context, msgs []Msg) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	idx := w.index.Load()
+	if len(idx.lens) == 0 {
 		return nil
 	}
-	topic := msg.Frames[0]
-	for conn, channel := range w.subscribers {
-		// Filter here, not in the subscriber's writer: the high-water mark must
-		// count only messages the peer asked for, as in libzmq.
-		if !conn.subscribedTo(topic) {
+	hwm := int(w.hwm.Load())
+	call := w.seq.Add(1)
+	var touchedBuf [64]*pubPeer
+	touched := touchedBuf[:0]
+	for i := range msgs {
+		if len(msgs[i].Frames) == 0 {
 			continue
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case channel <- msg: // proceeds to default case if the channel is full (msg will be discarded)
-		default:
+		topic := msgs[i].Frames[0]
+		stamp := w.seq.Add(1)
+		for _, n := range idx.lens {
+			if n > len(topic) {
+				continue
+			}
+			for _, p := range idx.peers[string(topic[:n])] {
+				if p.lastMsg.Swap(stamp) == stamp {
+					continue
+				}
+				p.push(msgs[i], hwm)
+				if p.lastCall.Swap(call) != call {
+					touched = append(touched, p)
+				}
+			}
 		}
+	}
+	for _, p := range touched {
+		p.signal()
 	}
 	return nil
 }

@@ -159,3 +159,58 @@ func TestConcurrentSendWithPongs(t *testing.T) {
 	default:
 	}
 }
+
+// A peer that only receives (it never sends anything of its own) must stay
+// connected while it answers PINGs: the timeout runs from an unanswered PING,
+// not from the last frame received. (The earlier logic closed such a peer when
+// the first tick fired late under load, before any PING went out; that timing
+// cannot be forced here, so this checks the intended behaviour only.)
+func TestHeartbeatKeepsReceiveOnlyPeer(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ep := must(EndPoint("tcp"))
+	// interval == timeout, as publishserver runs it (30s/30s)
+	router := NewRouter(ctx, WithRouterMandatory(), WithHeartbeat(20*time.Millisecond, 20*time.Millisecond))
+	defer router.Close()
+	if err := router.Listen(ep); err != nil {
+		t.Fatal(err)
+	}
+	dealer := NewDealer(ctx, WithID(SocketIdentity("listener")), WithInlineRecv())
+	defer dealer.Close()
+	if err := dealer.Dial(ep); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan string, 16)
+	go func() {
+		for {
+			m, err := dealer.Recv()
+			if err != nil {
+				close(got)
+				return
+			}
+			got <- string(m.Frames[len(m.Frames)-1])
+		}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for router.Send(NewMsgFrom([]byte("listener"), []byte("first"))) != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("peer never registered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if s := <-got; s != "first" {
+		t.Fatalf("got %q", s)
+	}
+	time.Sleep(400 * time.Millisecond) // many heartbeat timeouts, no data from the peer
+	if err := router.Send(NewMsgFrom([]byte("listener"), []byte("later"))); err != nil {
+		t.Fatalf("receive-only peer was dropped: %v", err)
+	}
+	select {
+	case s, ok := <-got:
+		if !ok || s != "later" {
+			t.Fatalf("got %q, open=%v", s, ok)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing received after idle period")
+	}
+}

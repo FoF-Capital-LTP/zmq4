@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 )
@@ -47,21 +48,77 @@ func TestConnSubscribedTo(t *testing.T) {
 	}
 }
 
+// stuckPeer registers c with mw without a writer goroutine: the peer never drains.
+func stuckPeer(mw *pubMWriter, c *Conn) *pubPeer {
+	p := &pubPeer{connQueue: newConnQueue(context.Background(), c)}
+	mw.mu.Lock()
+	mw.peers[c] = p
+	mw.reindexLocked()
+	mw.mu.Unlock()
+	return p
+}
+
 // TestPubHWMCountsOnlySubscribed: messages the peer did not subscribe to must not
 // take room in its queue, or unrelated traffic makes a slow peer drop its own.
 func TestPubHWMCountsOnlySubscribed(t *testing.T) {
 	mw := newPubMWriter(context.Background())
-	c := subscribedConn("mine")
-	queue := make(chan Msg, 10)
-	mw.subscribers[c] = queue // no writer goroutine: the peer is stuck
+	mw.hwm.Store(10)
+	p := stuckPeer(mw, subscribedConn("mine"))
 	for i := 0; i < 1000; i++ {
 		_ = mw.write(context.Background(), NewMsgString(fmt.Sprintf("other-%d", i)))
 	}
 	for i := 0; i < 5; i++ {
 		_ = mw.write(context.Background(), NewMsgString(fmt.Sprintf("mine-%d", i)))
 	}
-	if len(queue) != 5 {
-		t.Fatalf("queued %d messages, want the 5 subscribed ones", len(queue))
+	if len(p.q) != 5 {
+		t.Fatalf("queued %d messages, want the 5 subscribed ones", len(p.q))
+	}
+	for i := 0; i < 20; i++ {
+		_ = mw.write(context.Background(), NewMsgString("mine-more"))
+	}
+	if len(p.q) != 10 {
+		t.Fatalf("queued %d messages, want the high-water mark of 10", len(p.q))
+	}
+}
+
+// A peer subscribed to several prefixes of a topic gets the message once, and a
+// batch wakes each peer once.
+func TestPubWriteBatchDedupAndWake(t *testing.T) {
+	mw := newPubMWriter(context.Background())
+	a := stuckPeer(mw, subscribedConn("a", "ab", "abc"))
+	b := stuckPeer(mw, subscribedConn("x"))
+	all := stuckPeer(mw, subscribedConn(""))
+	msgs := []Msg{NewMsgString("abc-1"), NewMsgString("x-1"), NewMsgString("abd-2"), NewMsgString("zzz")}
+	_ = mw.writeBatch(context.Background(), msgs)
+	got := func(p *pubPeer) (out []string) {
+		for _, m := range p.q {
+			out = append(out, string(m.Frames[0]))
+		}
+		return out
+	}
+	if g := got(a); !slices.Equal(g, []string{"abc-1", "abd-2"}) {
+		t.Errorf("a got %v", g)
+	}
+	if g := got(b); !slices.Equal(g, []string{"x-1"}) {
+		t.Errorf("b got %v", g)
+	}
+	if g := got(all); len(g) != 4 {
+		t.Errorf("all got %v", g)
+	}
+	for name, p := range map[string]*pubPeer{"a": a, "b": b, "all": all} {
+		if len(p.wake) != 1 {
+			t.Errorf("%s not woken", name)
+		}
+	}
+	// unsubscribing takes effect once the index is rebuilt (the reader does it on every change)
+	a.conn.subscribe(NewMsg([]byte("\x00a")))
+	a.conn.subscribe(NewMsg([]byte("\x00ab")))
+	a.conn.subscribe(NewMsg([]byte("\x00abc")))
+	mw.reindex()
+	a.q = a.q[:0]
+	_ = mw.write(context.Background(), NewMsgString("abc-3"))
+	if len(a.q) != 0 {
+		t.Errorf("unsubscribed peer still gets %v", got(a))
 	}
 }
 

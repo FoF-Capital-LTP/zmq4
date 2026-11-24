@@ -112,9 +112,10 @@ func WithMaxRecvFrameSize(n int64) Option {
 }
 
 // WithHeartbeat sends a ZMTP PING on each connection every ivl and closes a
-// connection on which nothing has been received for timeout (rounded up to a
-// multiple of ivl), like libzmq's ZMQ_HEARTBEAT_IVL and ZMQ_HEARTBEAT_TIMEOUT.
-// Peers answer PINGs with PONGs, so a live connection always has traffic.
+// connection on which nothing has arrived for timeout after a PING (rounded up
+// to a multiple of ivl), like libzmq's ZMQ_HEARTBEAT_IVL and
+// ZMQ_HEARTBEAT_TIMEOUT. Peers answer PINGs with PONGs, so a live connection
+// stays up even when the peer never sends anything else.
 // timeout below ivl is raised to ivl. ivl 0 (the default) disables it.
 // With WithInlineRecv nothing is read outside Recv, so keep a goroutine in Recv
 // or a live connection looks silent and gets closed.
@@ -126,6 +127,20 @@ func WithHeartbeat(ivl, timeout time.Duration) Option {
 		}
 		s.hbIvl, s.hbTimeout = ivl, max(timeout, ivl)
 	}
+}
+
+// WithRouterMandatory makes a ROUTER's Send fail with ErrHostUnreachable when no
+// peer has the identity, and with ErrQueueFull when that peer's queue is full,
+// instead of dropping the message (ZMQ_ROUTER_MANDATORY).
+func WithRouterMandatory() Option {
+	return func(s *socket) { s.routerMandatory = true }
+}
+
+// WithRouterHandover makes a ROUTER hand an identity over to a new peer that
+// connects with it, closing the old connection (ZMQ_ROUTER_HANDOVER). Without
+// it the new connection is refused.
+func WithRouterHandover() Option {
+	return func(s *socket) { s.routerHandover = true }
 }
 
 // WithAutomaticReconnect allows to configure a socket to automatically

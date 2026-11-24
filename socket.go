@@ -30,6 +30,10 @@ var (
 	errInvalidAddress = errors.New("zmq4: invalid address")
 
 	ErrBadProperty = errors.New("zmq4: bad property")
+	// ErrHostUnreachable: a ROUTER with WithRouterMandatory has no peer with that identity.
+	ErrHostUnreachable = errors.New("zmq4: host unreachable")
+	// ErrQueueFull: a ROUTER with WithRouterMandatory has that peer's send queue at its high-water mark.
+	ErrQueueFull = errors.New("zmq4: peer send queue full")
 )
 
 // socket implements the ZeroMQ socket interface
@@ -48,8 +52,10 @@ type socket struct {
 
 	handshakeTimeout time.Duration
 	maxRecvFrame     uint64
-	recvBufSize      int           // SO_RCVBUF of new connections, 0 = OS default
-	sendBufSize      int           // SO_SNDBUF of new connections, 0 = OS default
+	recvBufSize      int // SO_RCVBUF of new connections, 0 = OS default
+	sendBufSize      int // SO_SNDBUF of new connections, 0 = OS default
+	routerMandatory  bool
+	routerHandover   bool
 	hbIvl            time.Duration // PING interval, 0 = no heartbeat
 	hbTimeout        time.Duration // close a connection silent for this long
 	timeout          time.Duration
@@ -356,7 +362,11 @@ func (sck *socket) heartbeat(c *Conn) {
 		ttl = 0xffff
 	}
 	ping := []byte{byte(ttl >> 8), byte(ttl)}
-	last, lastAt := c.rxFrames.Load(), time.Now()
+	// The timeout runs from the first PING sent after the last frame received, as
+	// in libzmq: a peer that only receives, and so never sends on its own, stays up
+	// as long as it answers PINGs.
+	last := c.rxFrames.Load()
+	var pingedAt time.Time // zero: nothing unanswered
 	for {
 		select {
 		case <-c.hbDone:
@@ -365,16 +375,19 @@ func (sck *socket) heartbeat(c *Conn) {
 			return
 		case now := <-t.C:
 			if n := c.rxFrames.Load(); n != last {
-				last, lastAt = n, now
-			} else if now.Sub(lastAt) >= sck.hbTimeout {
+				last, pingedAt = n, time.Time{}
+			} else if !pingedAt.IsZero() && now.Sub(pingedAt) >= sck.hbTimeout {
 				if sck.log != nil {
-					sck.log.Printf("nothing received from %v for %v, closing the connection", c.rw.RemoteAddr(), now.Sub(lastAt).Round(time.Millisecond))
+					sck.log.Printf("no answer from %v for %v after a PING, closing the connection", c.rw.RemoteAddr(), now.Sub(pingedAt).Round(time.Millisecond))
 				}
 				_ = c.Close()
 				return
 			}
 			if err := c.SendCmd(CmdPing, ping); err != nil {
 				return
+			}
+			if pingedAt.IsZero() {
+				pingedAt = now
 			}
 		}
 	}

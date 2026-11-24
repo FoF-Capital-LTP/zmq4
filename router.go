@@ -5,12 +5,10 @@
 package zmq4
 
 import (
-	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"sync"
-
-	"golang.org/x/sync/errgroup"
 )
 
 // NewRouter returns a new ROUTER ZeroMQ socket.
@@ -18,7 +16,7 @@ import (
 func NewRouter(ctx context.Context, opts ...Option) Socket {
 	router := &routerSocket{newSocket(ctx, Router, opts...)}
 	router.sck.r = newRouterQReader(router.sck.ctx)
-	router.sck.w = newRouterMWriter(router.sck.ctx)
+	router.sck.w = newRouterMWriter(router.sck.ctx, router.sck.routerMandatory, router.sck.routerHandover)
 	return router
 }
 
@@ -176,76 +174,95 @@ func (q *routerQReader) listen(ctx context.Context, r *Conn) {
 	}
 }
 
+// routerMWriter sends each message to the peer named by its first frame, through
+// that peer's queue: a slow peer never holds up the others or the caller.
 type routerMWriter struct {
-	ctx context.Context
-	mu  sync.Mutex
-	ws  []*Conn
-	sem *semaphore
+	ctx       context.Context
+	mandatory bool // unknown peer or full queue is an error, as ZMQ_ROUTER_MANDATORY
+	handover  bool // a new peer with a known identity replaces the old one, as ZMQ_ROUTER_HANDOVER
+
+	mu     sync.Mutex
+	peers  map[string]*connQueue // by identity
+	closed bool                  // after Close, a connection still finishing its handshake is not taken on
 }
 
-func newRouterMWriter(ctx context.Context) *routerMWriter {
-	return &routerMWriter{
-		ctx: ctx,
-		sem: newSemaphore(),
-	}
+func newRouterMWriter(ctx context.Context, mandatory, handover bool) *routerMWriter {
+	return &routerMWriter{ctx: ctx, mandatory: mandatory, handover: handover, peers: map[string]*connQueue{}}
 }
 
 func (w *routerMWriter) Close() error {
 	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
 	var err error
-	for _, ww := range w.ws {
-		e := ww.Close()
-		if e != nil && err == nil {
+	for _, q := range w.peers {
+		q.stop()
+		if e := q.conn.Close(); e != nil && err == nil {
 			err = e
 		}
 	}
-	w.ws = nil
-	w.mu.Unlock()
+	w.peers = map[string]*connQueue{}
 	return err
 }
 
-func (mw *routerMWriter) addConn(w *Conn) {
-	mw.mu.Lock()
-	mw.sem.enable()
-	mw.ws = append(mw.ws, w)
-	mw.mu.Unlock()
-}
-
-func (mw *routerMWriter) rmConn(w *Conn) {
-	mw.mu.Lock()
-	defer mw.mu.Unlock()
-
-	cur := -1
-	for i := range mw.ws {
-		if mw.ws[i] == w {
-			cur = i
-			break
-		}
-	}
-	if cur >= 0 {
-		mw.ws = append(mw.ws[:cur], mw.ws[cur+1:]...)
-	}
-}
-
-func (w *routerMWriter) write(ctx context.Context, msg Msg) error {
-	w.sem.lock(ctx)
-	grp, _ := errgroup.WithContext(ctx)
+func (w *routerMWriter) addConn(c *Conn) {
+	id := c.Peer.Meta[sysSockID]
 	w.mu.Lock()
-	id := msg.Frames[0]
-	dmsg := NewMsgFrom(msg.Frames[1:]...)
-	for i := range w.ws {
-		ww := w.ws[i]
-		pid := []byte(ww.Peer.Meta[sysSockID])
-		if !bytes.Equal(pid, id) {
-			continue
-		}
-		grp.Go(func() error {
-			return ww.SendMsg(dmsg)
-		})
+	if w.closed {
+		w.mu.Unlock()
+		_ = c.Close()
+		return
 	}
-	err := grp.Wait()
+	if old, ok := w.peers[id]; ok {
+		if !w.handover {
+			w.mu.Unlock()
+			// libzmq without handover refuses a second peer with the same identity
+			_ = c.Close()
+			return
+		}
+		old.stop()
+		_ = old.conn.Close()
+	}
+	q := newConnQueue(w.ctx, c)
+	w.peers[id] = q
 	w.mu.Unlock()
-	return err
+	go q.run()
+}
+
+func (w *routerMWriter) rmConn(c *Conn) {
+	id := c.Peer.Meta[sysSockID]
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if q, ok := w.peers[id]; ok && q.conn == c {
+		delete(w.peers, id)
+		q.stop()
+	}
+}
+
+// write queues msg.Frames[1:] for the peer whose identity is msg.Frames[0]. It
+// never blocks. Without mandatory, a message for an unknown peer or a peer with
+// a full queue is dropped, as libzmq does.
+func (w *routerMWriter) write(ctx context.Context, msg Msg) error {
+	if len(msg.Frames) < 2 {
+		return fmt.Errorf("zmq4: ROUTER message needs an identity frame and a body")
+	}
+	w.mu.Lock()
+	q := w.peers[string(msg.Frames[0])]
+	w.mu.Unlock()
+	if q == nil {
+		if w.mandatory {
+			return ErrHostUnreachable
+		}
+		return nil
+	}
+	if !q.push(Msg{Frames: msg.Frames[1:]}, DefaultSendHwm) {
+		if w.mandatory {
+			return ErrQueueFull
+		}
+		return nil
+	}
+	q.signal()
+	return nil
 }
 
 var (

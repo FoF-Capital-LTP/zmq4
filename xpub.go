@@ -13,8 +13,9 @@ import (
 // The returned socket value is initially unbound.
 func NewXPub(ctx context.Context, opts ...Option) Socket {
 	xpub := &xpubSocket{newSocket(ctx, XPub, opts...)}
-	xpub.sck.w = newPubMWriter(xpub.sck.ctx)
-	xpub.sck.r = newPubQReader(xpub.sck.ctx)
+	w, r := newPubMWriter(xpub.sck.ctx), newPubQReader(xpub.sck.ctx)
+	r.onSubscribe = w.reindex
+	xpub.sck.w, xpub.sck.r = w, r
 	return xpub
 }
 

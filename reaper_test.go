@@ -41,6 +41,7 @@ func TestConnReaperDeadlock2(t *testing.T) {
 		w.Peer.Meta = make(Metadata)
 		w.Peer.Meta[sysSockID] = id
 		w.rw = &sockSendEOF{}
+		w.sec = nullSecurity{}
 		w.onCloseErrorCB = srv.sck.scheduleRmConn
 		// Do not to call srv.addConn as we dont want to have listener on this fake socket
 		rmw.addConn(w)
