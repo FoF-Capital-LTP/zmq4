@@ -6,7 +6,6 @@ package zmq4
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -139,7 +138,7 @@ func (q *inlineReader) recv(ctx context.Context) (Msg, error) {
 			return m, m.err
 		}
 		if m.isCmd() {
-			if err := q.handleCmd(c, m); err != nil {
+			if err := c.handleCmd(m); err != nil {
 				q.rmConn(c)
 				_ = c.Close()
 				return Msg{err: err}, err
@@ -148,21 +147,6 @@ func (q *inlineReader) recv(ctx context.Context) (Msg, error) {
 		}
 		return m, nil
 	}
-}
-
-// handleCmd answers PING (like Conn.RecvMsg) and drops every other command.
-func (q *inlineReader) handleCmd(c *Conn, m Msg) error {
-	if len(m.Frames) != 1 {
-		return fmt.Errorf("zmq4: invalid command with %d frames", len(m.Frames))
-	}
-	var cmd Cmd
-	if err := cmd.unmarshalZMTP(m.Frames[0]); err != nil {
-		return fmt.Errorf("zmq4: could not unmarshal ZMTP command: %w", err)
-	}
-	if cmd.Name == CmdPing {
-		return c.SendCmd(CmdPong, nil)
-	}
-	return nil
 }
 
 // maxRetainedScratch is the largest scratch buffer kept between messages.

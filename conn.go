@@ -60,11 +60,22 @@ type Conn struct {
 	mu     sync.RWMutex
 	topics map[string]struct{} // set of subscribed topics
 
+	// wmu makes each message (all its frames) and each command one unit on the
+	// wire: the reader answers PINGs while the application may be sending.
+	wmu sync.Mutex
+	// rxFrames counts received frames; the heartbeat uses it to see traffic.
+	rxFrames atomic.Uint64
+	hbDone   chan struct{} // closed by Close; nil without a heartbeat
+	hbOnce   sync.Once
+
 	closed         int32
 	onCloseErrorCB func(c *Conn)
 }
 
 func (c *Conn) Close() error {
+	if c.hbDone != nil {
+		c.hbOnce.Do(func() { close(c.hbDone) })
+	}
 	return c.rw.Close()
 }
 
@@ -195,6 +206,8 @@ func (c *Conn) SendCmd(name string, body []byte) error {
 	if err != nil {
 		return err
 	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	return c.send(true, buf, 0)
 }
 
@@ -203,6 +216,8 @@ func (c *Conn) SendMsg(msg Msg) error {
 	if c.Closed() {
 		return ErrClosedConn
 	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	if msg.multipart {
 		return c.sendMulti(msg)
 	}
@@ -392,6 +407,35 @@ func (c *Conn) send(isCommand bool, body []byte, flag byte) error {
 	return nil
 }
 
+// readMsg reads the next application message. Commands are not for the
+// application: PING is answered, the others are dropped.
+func (c *Conn) readMsg() Msg {
+	for {
+		msg := c.read()
+		if msg.err != nil || !msg.isCmd() {
+			return msg
+		}
+		if err := c.handleCmd(msg); err != nil {
+			return Msg{err: err}
+		}
+	}
+}
+
+// handleCmd answers PING (like RecvMsg) and ignores every other command.
+func (c *Conn) handleCmd(m Msg) error {
+	if len(m.Frames) != 1 {
+		return fmt.Errorf("zmq4: invalid command with %d frames", len(m.Frames))
+	}
+	var cmd Cmd
+	if err := cmd.unmarshalZMTP(m.Frames[0]); err != nil {
+		return fmt.Errorf("zmq4: could not unmarshal ZMTP command: %w", err)
+	}
+	if cmd.Name == CmdPing {
+		return c.SendCmd(CmdPong, nil)
+	}
+	return nil
+}
+
 // read returns the isCommand flag, the body of the message, and optionally an error
 func (c *Conn) read() Msg {
 	var (
@@ -442,6 +486,7 @@ func (c *Conn) readFrameHeader() (flag, uint64, error) {
 		c.checkIO(err)
 		return 0, 0, err
 	}
+	c.rxFrames.Add(1)
 	fl := flag(c.hdr[0])
 	size := uint64(c.hdr[1])
 	if fl.isLong() {

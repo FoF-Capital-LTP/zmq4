@@ -48,8 +48,10 @@ type socket struct {
 
 	handshakeTimeout time.Duration
 	maxRecvFrame     uint64
-	recvBufSize      int // SO_RCVBUF of new connections, 0 = OS default
-	sendBufSize      int // SO_SNDBUF of new connections, 0 = OS default
+	recvBufSize      int           // SO_RCVBUF of new connections, 0 = OS default
+	sendBufSize      int           // SO_SNDBUF of new connections, 0 = OS default
+	hbIvl            time.Duration // PING interval, 0 = no heartbeat
+	hbTimeout        time.Duration // close a connection silent for this long
 	timeout          time.Duration
 
 	mu    sync.RWMutex
@@ -333,7 +335,49 @@ func (sck *socket) openConn(conn net.Conn, server bool) (*Conn, error) {
 	}
 	_ = conn.SetDeadline(time.Time{})
 	zconn.maxRecvFrame = sck.maxRecvFrame
+	if sck.hbIvl > 0 {
+		zconn.hbDone = make(chan struct{})
+		go sck.heartbeat(zconn)
+	}
 	return zconn, nil
+}
+
+// heartbeat sends a PING every hbIvl and closes the connection when nothing,
+// PONG or anything else, has arrived for hbTimeout. Without it a peer that
+// vanished without closing TCP (host down, network cut) goes unnoticed while
+// there is nothing to receive. Closing makes the pending or next Recv fail,
+// which is how the application learns of it.
+func (sck *socket) heartbeat(c *Conn) {
+	t := time.NewTicker(sck.hbIvl)
+	defer t.Stop()
+	// ZMTP 3.1 PING body: TTL in deciseconds, then an empty context.
+	ttl := sck.hbTimeout / (100 * time.Millisecond)
+	if ttl > 0xffff {
+		ttl = 0xffff
+	}
+	ping := []byte{byte(ttl >> 8), byte(ttl)}
+	last, lastAt := c.rxFrames.Load(), time.Now()
+	for {
+		select {
+		case <-c.hbDone:
+			return
+		case <-sck.ctx.Done():
+			return
+		case now := <-t.C:
+			if n := c.rxFrames.Load(); n != last {
+				last, lastAt = n, now
+			} else if now.Sub(lastAt) >= sck.hbTimeout {
+				if sck.log != nil {
+					sck.log.Printf("nothing received from %v for %v, closing the connection", c.rw.RemoteAddr(), now.Sub(lastAt).Round(time.Millisecond))
+				}
+				_ = c.Close()
+				return
+			}
+			if err := c.SendCmd(CmdPing, ping); err != nil {
+				return
+			}
+		}
+	}
 }
 
 func (sck *socket) addConn(c *Conn) {

@@ -183,7 +183,7 @@ func (r *reqReader) read(ctx context.Context, msg *Msg) error {
 	if curConn == nil {
 		return fmt.Errorf("zmq4: no connections available")
 	}
-	*msg = curConn.read()
+	*msg = curConn.readMsg()
 	if msg.err != nil {
 		return msg.err
 	}

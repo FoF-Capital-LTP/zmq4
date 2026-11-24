@@ -158,7 +158,7 @@ func (q *routerQReader) listen(ctx context.Context, r *Conn) {
 
 	id := []byte(r.Peer.Meta[sysSockID])
 	for {
-		msg := r.read()
+		msg := r.readMsg()
 		select {
 		case <-ctx.Done():
 			return

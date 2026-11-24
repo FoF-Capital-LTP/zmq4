@@ -111,6 +111,23 @@ func WithMaxRecvFrameSize(n int64) Option {
 	}
 }
 
+// WithHeartbeat sends a ZMTP PING on each connection every ivl and closes a
+// connection on which nothing has been received for timeout (rounded up to a
+// multiple of ivl), like libzmq's ZMQ_HEARTBEAT_IVL and ZMQ_HEARTBEAT_TIMEOUT.
+// Peers answer PINGs with PONGs, so a live connection always has traffic.
+// timeout below ivl is raised to ivl. ivl 0 (the default) disables it.
+// With WithInlineRecv nothing is read outside Recv, so keep a goroutine in Recv
+// or a live connection looks silent and gets closed.
+func WithHeartbeat(ivl, timeout time.Duration) Option {
+	return func(s *socket) {
+		if ivl <= 0 {
+			s.hbIvl, s.hbTimeout = 0, 0
+			return
+		}
+		s.hbIvl, s.hbTimeout = ivl, max(timeout, ivl)
+	}
+}
+
 // WithAutomaticReconnect allows to configure a socket to automatically
 // reconnect on connection loss.
 func WithAutomaticReconnect(automaticReconnect bool) Option {

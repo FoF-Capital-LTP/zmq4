@@ -102,7 +102,7 @@ func (q *qreader) listen(ctx context.Context, r *Conn) {
 	defer r.Close()
 
 	for {
-		msg := r.read()
+		msg := r.readMsg()
 		select {
 		case <-ctx.Done():
 			return

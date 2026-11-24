@@ -159,7 +159,7 @@ func (r *repReader) listen(ctx context.Context, conn *Conn) {
 	defer conn.Close()
 
 	for {
-		msg := conn.read()
+		msg := conn.readMsg()
 		select {
 		case <-ctx.Done():
 			return
