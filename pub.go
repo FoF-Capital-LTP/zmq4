@@ -252,6 +252,9 @@ func (w *pubMWriter) Close() error {
 	return nil
 }
 
+// pubBatch is the most messages a subscriber's writer puts in one write.
+const pubBatch = 64
+
 func (mw *pubMWriter) addConn(w *Conn) {
 	mw.mu.Lock()
 	defer mw.mu.Unlock()
@@ -259,15 +262,35 @@ func (mw *pubMWriter) addConn(w *Conn) {
 	c := make(chan Msg, mw.hwm.Load())
 	mw.subscribers[w] = c
 	go func() {
+		// Messages are filtered by write, so everything queued is for this peer.
+		// Drain what is queued into one write, as libzmq batches its encoder output.
+		batch := make([]Msg, 0, pubBatch)
 		for {
 			msg, ok := <-c
 			if !ok {
-				break
+				return
 			}
-			topic := string(msg.Frames[0])
-			if w.subscribed(topic) {
-				_ = w.SendMsg(msg)
+			batch = append(batch[:0], msg)
+		fill:
+			for len(batch) < pubBatch {
+				select {
+				case m, ok := <-c:
+					if !ok {
+						break fill
+					}
+					batch = append(batch, m)
+				default:
+					break fill
+				}
 			}
+			if w.sec.Type() == NullSecurity {
+				_ = w.sendBatch(batch)
+			} else {
+				for _, m := range batch {
+					_ = w.SendMsg(m)
+				}
+			}
+			clear(batch)
 		}
 	}()
 }
@@ -287,7 +310,16 @@ func (w *pubMWriter) write(ctx context.Context, msg Msg) error {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
-	for _, channel := range w.subscribers {
+	if len(msg.Frames) == 0 {
+		return nil
+	}
+	topic := msg.Frames[0]
+	for conn, channel := range w.subscribers {
+		// Filter here, not in the subscriber's writer: the high-water mark must
+		// count only messages the peer asked for, as in libzmq.
+		if !conn.subscribedTo(topic) {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

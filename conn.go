@@ -12,7 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strings"
+	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -59,6 +59,11 @@ type Conn struct {
 
 	mu     sync.RWMutex
 	topics map[string]struct{} // set of subscribed topics
+	// topicLens holds the distinct lengths in topics, so matching a message is
+	// one map lookup per length instead of a prefix comparison per topic.
+	topicLens []int
+
+	batchBufs net.Buffers // sendBatch scratch, used under wmu
 
 	// wmu makes each message (all its frames) and each command one unit on the
 	// wire: the reader answers PINGs while the application may be sending.
@@ -572,22 +577,80 @@ func (conn *Conn) subscribe(msg Msg) {
 	case 1:
 		conn.topics[k] = struct{}{}
 	}
+	conn.topicLens = conn.topicLens[:0]
+	for t := range conn.topics {
+		if !slices.Contains(conn.topicLens, len(t)) {
+			conn.topicLens = append(conn.topicLens, len(t))
+		}
+	}
 	conn.mu.Unlock()
 }
 
 func (conn *Conn) subscribed(topic string) bool {
+	return conn.subscribedTo([]byte(topic))
+}
+
+// subscribedTo reports whether a message whose first frame is topic matches one
+// of the peer's subscriptions (prefix match, "" matches everything). It does
+// not allocate.
+func (conn *Conn) subscribedTo(topic []byte) bool {
 	conn.mu.RLock()
 	defer conn.mu.RUnlock()
-	for k := range conn.topics {
-		switch {
-		case k == "":
-			// subscribed to everything
-			return true
-		case strings.HasPrefix(topic, k):
-			return true
+	for _, n := range conn.topicLens {
+		if n <= len(topic) {
+			if _, ok := conn.topics[string(topic[:n])]; ok {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// sendBatch writes msgs with as few syscalls as possible (one writev when they
+// fit), holding the write lock for the whole batch. NULL security only.
+func (c *Conn) sendBatch(msgs []Msg) error {
+	if c.Closed() {
+		return ErrClosedConn
+	}
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	nframes := 0
+	for i := range msgs {
+		nframes += len(msgs[i].Frames)
+	}
+	// Fresh per batch: a transport may keep referencing what was written after
+	// Write returns (inproc does), so headers cannot be reused.
+	hdrs := make([]byte, 9*nframes)
+	bufs := c.batchBufs[:0]
+	for i := range msgs {
+		frames := msgs[i].Frames
+		for j, frame := range frames {
+			var flag byte
+			if j < len(frames)-1 {
+				flag ^= hasMoreBitFlag
+			}
+			hdr := hdrs[:9]
+			hdrs = hdrs[9:]
+			size := len(frame)
+			hsz := 2
+			if size > 255 {
+				hdr[0] = flag ^ isLongBitFlag
+				binary.BigEndian.PutUint64(hdr[1:], uint64(size))
+				hsz = 9
+			} else {
+				hdr[0] = flag
+				hdr[1] = uint8(size)
+			}
+			bufs = append(bufs, hdr[:hsz], frame)
+		}
+	}
+	c.batchBufs = bufs // WriteTo consumes its receiver; keep the backing array
+	_, err := bufs.WriteTo(c.rw)
+	clear(c.batchBufs[:cap(c.batchBufs)]) // do not pin sent messages
+	if err != nil {
+		c.checkIO(err)
+	}
+	return err
 }
 
 func (conn *Conn) SetClosed() {
