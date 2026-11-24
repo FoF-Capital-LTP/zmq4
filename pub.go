@@ -28,7 +28,7 @@ type Topics interface {
 func NewPub(ctx context.Context, opts ...Option) Socket {
 	pub := &pubSocket{sck: newSocket(ctx, Pub, opts...)}
 	w, r := newPubMWriter(pub.sck.ctx), newPubQReader(pub.sck.ctx)
-	r.onSubscribe = w.reindex
+	r.onSubscribe = w.subscribed
 	pub.sck.w, pub.sck.r = w, r
 	return pub
 }
@@ -130,7 +130,7 @@ func (pub *pubSocket) Topics() []string {
 type pubQReader struct {
 	ctx context.Context
 
-	onSubscribe func() // called after a peer's subscriptions changed
+	onSubscribe func(c *Conn, topic string, added bool) // called for each change to a peer's subscriptions
 
 	mu sync.RWMutex
 	rs []*Conn
@@ -198,6 +198,8 @@ func (q *pubQReader) read(ctx context.Context, msg *Msg) error {
 func (q *pubQReader) listen(ctx context.Context, r *Conn) {
 	defer q.rmConn(r)
 	defer r.Close()
+	// Whatever ends the read loop, the writer must drop this peer too.
+	defer r.SetClosed()
 
 	for {
 		msg := r.readMsg()
@@ -210,9 +212,8 @@ func (q *pubQReader) listen(ctx context.Context, r *Conn) {
 			}
 			switch {
 			case q.topic(msg):
-				r.subscribe(msg)
-				if q.onSubscribe != nil {
-					q.onSubscribe()
+				if topic, added, changed := r.subscribe(msg); changed && q.onSubscribe != nil {
+					q.onSubscribe(r, topic, added)
 				}
 			default:
 				select {
@@ -246,30 +247,72 @@ type pubPeer struct {
 
 // pubIndex maps every subscribed prefix to the peers holding it. Matching a
 // message is one lookup per distinct prefix length, whatever the peer count.
+// It is updated one (un)subscription at a time: rebuilding it per subscription
+// would make a reconnect storm quadratic.
 type pubIndex struct {
-	lens  []int
-	peers map[string][]*pubPeer
+	lens     []int       // distinct prefix lengths in peers
+	lenCount map[int]int // prefixes per length
+	peers    map[string][]*pubPeer
+}
+
+func newPubIndex() *pubIndex {
+	return &pubIndex{lenCount: map[int]int{}, peers: map[string][]*pubPeer{}}
+}
+
+func (x *pubIndex) add(topic string, p *pubPeer) {
+	ps := x.peers[topic]
+	if len(ps) == 0 {
+		if x.lenCount[len(topic)] == 0 {
+			x.lens = append(x.lens, len(topic))
+		}
+		x.lenCount[len(topic)]++
+	}
+	x.peers[topic] = append(ps, p)
+}
+
+func (x *pubIndex) remove(topic string, p *pubPeer) {
+	ps := x.peers[topic]
+	i := slices.Index(ps, p)
+	if i < 0 {
+		return
+	}
+	ps = slices.Delete(ps, i, i+1)
+	if len(ps) > 0 {
+		x.peers[topic] = ps
+		return
+	}
+	delete(x.peers, topic)
+	if x.lenCount[len(topic)]--; x.lenCount[len(topic)] == 0 {
+		delete(x.lenCount, len(topic))
+		x.lens = slices.DeleteFunc(x.lens, func(n int) bool { return n == len(topic) })
+	}
 }
 
 type pubMWriter struct {
 	ctx context.Context
 
-	mu     sync.Mutex // guards peers and closed; serializes reindex
+	// mu guards peers, index and closed: writes match under the read lock,
+	// (un)subscriptions and peer changes take the write lock.
+	mu     sync.RWMutex
 	peers  map[*Conn]*pubPeer
+	index  *pubIndex
 	closed bool // after Close, a connection still finishing its handshake is not taken on
-	index  atomic.Pointer[pubIndex]
 
-	seq atomic.Uint64 // message and call stamps
-	hwm atomic.Int64
+	// sendMu serializes writeBatch calls: the per-message stamps that keep a
+	// peer matching through several prefixes from getting a message twice are
+	// only meaningful within one call at a time.
+	sendMu sync.Mutex
+	seq    uint64 // message and call stamps, under sendMu
+	hwm    atomic.Int64
 }
 
 func newPubMWriter(ctx context.Context) *pubMWriter {
 	p := &pubMWriter{
 		ctx:   ctx,
 		peers: map[*Conn]*pubPeer{},
+		index: newPubIndex(),
 	}
 	p.hwm.Store(DefaultSendHwm)
-	p.index.Store(&pubIndex{})
 	return p
 }
 
@@ -283,7 +326,7 @@ func (w *pubMWriter) Close() error {
 		p.stop()
 	}
 	w.peers = map[*Conn]*pubPeer{}
-	w.index.Store(&pubIndex{})
+	w.index = newPubIndex()
 	return nil
 }
 
@@ -295,8 +338,7 @@ func (w *pubMWriter) addConn(c *Conn) {
 		_ = c.Close()
 		return
 	}
-	w.peers[c] = p
-	w.reindexLocked()
+	w.peers[c] = p // no subscriptions yet: they arrive through subscribed
 	w.mu.Unlock()
 	go p.run()
 }
@@ -309,30 +351,27 @@ func (w *pubMWriter) rmConn(c *Conn) {
 		_ = c.Close()
 		delete(w.peers, c)
 		p.stop()
-		w.reindexLocked()
-	}
-}
-
-// reindex rebuilds the prefix index after a peer's subscriptions changed.
-func (w *pubMWriter) reindex() {
-	w.mu.Lock()
-	w.reindexLocked()
-	w.mu.Unlock()
-}
-
-func (w *pubMWriter) reindexLocked() {
-	idx := &pubIndex{peers: map[string][]*pubPeer{}}
-	for c, p := range w.peers {
 		c.mu.RLock()
 		for t := range c.topics {
-			if _, seen := idx.peers[t]; !seen && !slices.Contains(idx.lens, len(t)) {
-				idx.lens = append(idx.lens, len(t))
-			}
-			idx.peers[t] = append(idx.peers[t], p)
+			w.index.remove(t, p)
 		}
 		c.mu.RUnlock()
 	}
-	w.index.Store(idx)
+}
+
+// subscribed applies one change to c's subscriptions to the index.
+func (w *pubMWriter) subscribed(c *Conn, topic string, added bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	p, ok := w.peers[c]
+	if !ok {
+		return
+	}
+	if added {
+		w.index.add(topic, p)
+	} else {
+		w.index.remove(topic, p)
+	}
 }
 
 func (w *pubMWriter) write(ctx context.Context, msg Msg) error {
@@ -348,12 +387,17 @@ func (w *pubMWriter) writeBatch(ctx context.Context, msgs []Msg) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	idx := w.index.Load()
+	w.sendMu.Lock()
+	defer w.sendMu.Unlock()
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	idx := w.index
 	if len(idx.lens) == 0 {
 		return nil
 	}
 	hwm := int(w.hwm.Load())
-	call := w.seq.Add(1)
+	w.seq++
+	call := w.seq
 	var touchedBuf [64]*pubPeer
 	touched := touchedBuf[:0]
 	for i := range msgs {
@@ -361,7 +405,8 @@ func (w *pubMWriter) writeBatch(ctx context.Context, msgs []Msg) error {
 			continue
 		}
 		topic := msgs[i].Frames[0]
-		stamp := w.seq.Add(1)
+		w.seq++
+		stamp := w.seq
 		for _, n := range idx.lens {
 			if n > len(topic) {
 				continue

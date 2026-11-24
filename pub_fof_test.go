@@ -8,43 +8,72 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 )
 
 func subscribedConn(topics ...string) *Conn {
-	c := &Conn{topics: make(map[string]struct{})}
+	rw, _ := net.Pipe() // only Close is used
+	c := &Conn{topics: make(map[string]struct{}), rw: rw}
 	for _, t := range topics {
 		c.subscribe(NewMsg(append([]byte{1}, t...)))
 	}
 	return c
 }
 
-func TestConnSubscribedTo(t *testing.T) {
-	c := subscribedConn("ab", "xyz")
-	for topic, want := range map[string]bool{
-		"ab": true, "abc": true, "xyz1": true, "a": false, "xy": false, "b": false, "": false,
-	} {
-		if got := c.subscribedTo([]byte(topic)); got != want {
-			t.Errorf("subscribedTo(%q) = %v, want %v", topic, got, want)
-		}
+// queued returns the first frames of what p has queued.
+func queued(p *pubPeer) (out []string) {
+	for _, m := range p.q {
+		out = append(out, string(m.Frames[0]))
 	}
-	c.subscribe(NewMsg([]byte("\x00ab"))) // unsubscribe
-	if c.subscribedTo([]byte("abc")) {
-		t.Error("still subscribed to ab after unsubscribing")
-	}
-	if !c.subscribedTo([]byte("xyz")) {
-		t.Error("lost xyz after unsubscribing ab")
-	}
-	c.subscribe(NewMsg([]byte{1})) // everything
-	if !c.subscribedTo([]byte("anything")) || !c.subscribedTo(nil) {
-		t.Error("empty subscription must match everything")
-	}
+	return out
+}
 
-	topic := []byte("xyz-some-long-topic")
-	if n := testing.AllocsPerRun(100, func() { c.subscribedTo(topic) }); n != 0 {
-		t.Errorf("subscribedTo allocates %v times per call", n)
+func TestPubIndexMatching(t *testing.T) {
+	mw := newPubMWriter(context.Background())
+	p := stuckPeer(mw, subscribedConn("ab", "xyz"))
+	msgs := []string{"ab", "abc", "xyz1", "a", "xy", "b", ""}
+	for _, m := range msgs {
+		_ = mw.write(context.Background(), NewMsgString(m))
+	}
+	if g := queued(p); !slices.Equal(g, []string{"ab", "abc", "xyz1"}) {
+		t.Fatalf("matched %v", g)
+	}
+	p.q = p.q[:0]
+	unsubscribe(mw, p.conn, "ab")
+	_ = mw.write(context.Background(), NewMsgString("abc"))
+	_ = mw.write(context.Background(), NewMsgString("xyz"))
+	if g := queued(p); !slices.Equal(g, []string{"xyz"}) {
+		t.Fatalf("after unsubscribing ab matched %v", g)
+	}
+	if len(mw.index.lens) != 1 || mw.index.lens[0] != 3 {
+		t.Fatalf("prefix lengths %v after unsubscribing ab, want [3]", mw.index.lens)
+	}
+	p.q = p.q[:0]
+	subscribe(mw, p.conn, "") // everything
+	_ = mw.write(context.Background(), NewMsgString("anything"))
+	if g := queued(p); !slices.Equal(g, []string{"anything"}) {
+		t.Fatalf("empty subscription matched %v", g)
+	}
+	// removing the peer removes its prefixes
+	mw.rmConn(p.conn)
+	if len(mw.index.peers) != 0 || len(mw.index.lens) != 0 {
+		t.Fatalf("index not empty after rmConn: %v %v", mw.index.peers, mw.index.lens)
+	}
+}
+
+func subscribe(mw *pubMWriter, c *Conn, topic string) {
+	if t, added, changed := c.subscribe(NewMsg(append([]byte{1}, topic...))); changed {
+		mw.subscribed(c, t, added)
+	}
+}
+
+func unsubscribe(mw *pubMWriter, c *Conn, topic string) {
+	if t, added, changed := c.subscribe(NewMsg(append([]byte{0}, topic...))); changed {
+		mw.subscribed(c, t, added)
 	}
 }
 
@@ -53,7 +82,11 @@ func stuckPeer(mw *pubMWriter, c *Conn) *pubPeer {
 	p := &pubPeer{connQueue: newConnQueue(context.Background(), c)}
 	mw.mu.Lock()
 	mw.peers[c] = p
-	mw.reindexLocked()
+	c.mu.RLock()
+	for t := range c.topics {
+		mw.index.add(t, p)
+	}
+	c.mu.RUnlock()
 	mw.mu.Unlock()
 	return p
 }
@@ -110,11 +143,9 @@ func TestPubWriteBatchDedupAndWake(t *testing.T) {
 			t.Errorf("%s not woken", name)
 		}
 	}
-	// unsubscribing takes effect once the index is rebuilt (the reader does it on every change)
-	a.conn.subscribe(NewMsg([]byte("\x00a")))
-	a.conn.subscribe(NewMsg([]byte("\x00ab")))
-	a.conn.subscribe(NewMsg([]byte("\x00abc")))
-	mw.reindex()
+	for _, topic := range []string{"a", "ab", "abc"} {
+		unsubscribe(mw, a.conn, topic)
+	}
 	a.q = a.q[:0]
 	_ = mw.write(context.Background(), NewMsgString("abc-3"))
 	if len(a.q) != 0 {
@@ -187,5 +218,49 @@ wait:
 			!bytes.Equal(m.Frames[1], bytes.Repeat([]byte{byte(i)}, i%600)) || string(m.Frames[2]) != "end" {
 			t.Fatalf("message %d wrong or out of order: %q...", i, m.Frames[0])
 		}
+	}
+}
+
+// Concurrent senders: a peer matching through several prefixes still gets each
+// message exactly once.
+func TestPubConcurrentWriteBatchNoDuplicates(t *testing.T) {
+	mw := newPubMWriter(context.Background())
+	mw.hwm.Store(1 << 30)
+	p := stuckPeer(mw, subscribedConn("", "a", "ab"))
+	const senders, each = 4, 5000
+	var wg sync.WaitGroup
+	for g := 0; g < senders; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < each; i++ {
+				_ = mw.write(context.Background(), NewMsgString("abc"))
+			}
+		}()
+	}
+	wg.Wait()
+	if n := len(p.q); n != senders*each {
+		t.Fatalf("peer got %d messages, want %d", n, senders*each)
+	}
+}
+
+// Many subscribers reconnecting with many topics each: subscriptions must be
+// indexed in time linear in their number, not quadratic.
+func TestPubSubscriptionStorm(t *testing.T) {
+	mw := newPubMWriter(context.Background())
+	const peers, topics = 200, 300
+	start := time.Now()
+	for i := 0; i < peers; i++ {
+		c := subscribedConn()
+		stuckPeer(mw, c)
+		for j := 0; j < topics; j++ {
+			subscribe(mw, c, fmt.Sprintf("topic-%03d", j))
+		}
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("indexing %d subscriptions took %v", peers*topics, d)
+	}
+	if n := len(mw.index.peers["topic-007"]); n != peers {
+		t.Fatalf("topic-007 has %d peers, want %d", n, peers)
 	}
 }

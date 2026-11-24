@@ -32,10 +32,9 @@ func (router *routerSocket) Close() error {
 
 // Send puts the message on the outbound send queue.
 // Send blocks until the message can be queued or the send deadline expires.
+// Send queues msg.Frames[1:] for the peer named by msg.Frames[0]; it never blocks.
 func (router *routerSocket) Send(msg Msg) error {
-	ctx, cancel := context.WithTimeout(router.sck.ctx, router.sck.Timeout())
-	defer cancel()
-	return router.sck.w.write(ctx, msg)
+	return router.sck.w.write(router.sck.ctx, msg)
 }
 
 // SendMulti puts the message on the outbound send queue.
@@ -153,6 +152,9 @@ func (q *routerQReader) read(ctx context.Context, msg *Msg) error {
 func (q *routerQReader) listen(ctx context.Context, r *Conn) {
 	defer q.rmConn(r)
 	defer r.Close()
+	// Whatever ends the read loop, the writer must drop this peer too, so a
+	// mandatory Send to it fails instead of queueing into a dead connection.
+	defer r.SetClosed()
 
 	id := []byte(r.Peer.Meta[sysSockID])
 	for {

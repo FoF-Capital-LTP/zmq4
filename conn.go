@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"sync"
 	"sync/atomic"
 )
@@ -57,13 +56,9 @@ type Conn struct {
 		Meta   Metadata
 	}
 
-	mu     sync.RWMutex
-	topics map[string]struct{} // set of subscribed topics
-	// topicLens holds the distinct lengths in topics, so matching a message is
-	// one map lookup per length instead of a prefix comparison per topic.
-	topicLens []int
-
-	batchBufs net.Buffers // sendBatch scratch, used under wmu
+	mu        sync.RWMutex
+	topics    map[string]struct{} // set of subscribed topics
+	batchBufs net.Buffers         // sendBatch scratch, used under wmu
 
 	// wmu makes each message (all its frames) and each command one unit on the
 	// wire: the reader answers PINGs while the application may be sending.
@@ -214,6 +209,24 @@ func (c *Conn) SendCmd(name string, body []byte) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 	return c.send(true, buf, 0)
+}
+
+// trySendCmd sends a command unless a write is in progress, in which case it
+// reports sent=false at once instead of waiting behind it.
+func (c *Conn) trySendCmd(name string, body []byte) (sent bool, err error) {
+	if c.Closed() {
+		return false, ErrClosedConn
+	}
+	cmd := Cmd{Name: name, Body: body}
+	buf, err := cmd.marshalZMTP()
+	if err != nil {
+		return false, err
+	}
+	if !c.wmu.TryLock() {
+		return false, nil
+	}
+	defer c.wmu.Unlock()
+	return true, c.send(true, buf, 0)
 }
 
 // SendMsg sends a ZMTP message over the wire.
@@ -567,43 +580,27 @@ func (c *Conn) readBorrowed(frames [][]byte, scratch []byte) (Msg, []byte) {
 	return msg, scratch
 }
 
-func (conn *Conn) subscribe(msg Msg) {
+// subscribe applies a subscription (1) or unsubscription (0) message and
+// reports the topic and whether it changed the set of subscribed topics.
+func (conn *Conn) subscribe(msg Msg) (topic string, added, changed bool) {
 	conn.mu.Lock()
+	defer conn.mu.Unlock()
 	v := msg.Frames[0]
 	k := string(v[1:])
+	_, had := conn.topics[k]
 	switch v[0] {
 	case 0:
-		delete(conn.topics, k)
+		if had {
+			delete(conn.topics, k)
+			return k, false, true
+		}
 	case 1:
-		conn.topics[k] = struct{}{}
-	}
-	conn.topicLens = conn.topicLens[:0]
-	for t := range conn.topics {
-		if !slices.Contains(conn.topicLens, len(t)) {
-			conn.topicLens = append(conn.topicLens, len(t))
+		if !had {
+			conn.topics[k] = struct{}{}
+			return k, true, true
 		}
 	}
-	conn.mu.Unlock()
-}
-
-func (conn *Conn) subscribed(topic string) bool {
-	return conn.subscribedTo([]byte(topic))
-}
-
-// subscribedTo reports whether a message whose first frame is topic matches one
-// of the peer's subscriptions (prefix match, "" matches everything). It does
-// not allocate.
-func (conn *Conn) subscribedTo(topic []byte) bool {
-	conn.mu.RLock()
-	defer conn.mu.RUnlock()
-	for _, n := range conn.topicLens {
-		if n <= len(topic) {
-			if _, ok := conn.topics[string(topic[:n])]; ok {
-				return true
-			}
-		}
-	}
-	return false
+	return k, false, false
 }
 
 // sendBatch writes msgs with as few syscalls as possible (one writev when they

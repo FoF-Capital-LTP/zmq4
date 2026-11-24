@@ -14,7 +14,7 @@ import (
 func NewXPub(ctx context.Context, opts ...Option) Socket {
 	xpub := &xpubSocket{newSocket(ctx, XPub, opts...)}
 	w, r := newPubMWriter(xpub.sck.ctx), newPubQReader(xpub.sck.ctx)
-	r.onSubscribe = w.reindex
+	r.onSubscribe = w.subscribed
 	xpub.sck.w, xpub.sck.r = w, r
 	return xpub
 }

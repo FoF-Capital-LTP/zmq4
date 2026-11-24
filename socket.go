@@ -163,6 +163,11 @@ func (sck *socket) Close() error {
 		}
 	}
 
+	// Stop the writers' per-peer goroutines and refuse connections still handshaking.
+	if sck.w != nil {
+		_ = sck.w.Close()
+	}
+
 	// Remove the unix socket file if created by net.Listen
 	if sck.listener != nil && strings.HasPrefix(sck.ep, "ipc://") {
 		os.Remove(sck.ep[len("ipc://"):])
@@ -237,14 +242,25 @@ func (sck *socket) accept() {
 				continue
 			}
 
-			zconn, err := sck.openConn(conn, true)
-			if err != nil {
-				// FIXME(sbinet): maybe bubble up this error to application code?
-				sck.log.Printf("could not open a ZMTP connection with %q: %+v", sck.ep, err)
-				continue
+			open := func() {
+				zconn, err := sck.openConn(conn, true)
+				if err != nil {
+					// FIXME(sbinet): maybe bubble up this error to application code?
+					sck.log.Printf("could not open a ZMTP connection with %q: %+v", sck.ep, err)
+					return
+				}
+				sck.addConn(zconn)
 			}
-
-			sck.addConn(zconn)
+			// Handshake each network connection on its own goroutine, as libzmq
+			// does: one peer that connects and then says nothing must not hold up
+			// the others until the handshake timeout. The inproc listener's Accept
+			// does not block (the handshake is what waits for a dialer), so there
+			// the handshake has to pace the loop.
+			if strings.HasPrefix(sck.ep, "inproc://") {
+				open()
+			} else {
+				go open()
+			}
 		}
 	}
 }
@@ -383,7 +399,11 @@ func (sck *socket) heartbeat(c *Conn) {
 				_ = c.Close()
 				return
 			}
-			if err := c.SendCmd(CmdPing, ping); err != nil {
+			// A write still in progress holds the connection's write lock: skip the
+			// PING and count it as unanswered. If the peer has stopped reading, that
+			// write never finishes and the timeout closes the connection, which also
+			// unblocks the write.
+			if _, err := c.trySendCmd(CmdPing, ping); err != nil {
 				return
 			}
 			if pingedAt.IsZero() {

@@ -132,6 +132,10 @@ func (q *inlineReader) recv(ctx context.Context) (Msg, error) {
 		}
 		if m.err != nil {
 			q.rmConn(c)
+			// Frame errors (too large, overflow) leave the connection open: close
+			// it, and let the socket drop it from its writer as well.
+			_ = c.Close()
+			c.SetClosed()
 			if err := ctx.Err(); err != nil {
 				return Msg{}, err
 			}
@@ -141,6 +145,7 @@ func (q *inlineReader) recv(ctx context.Context) (Msg, error) {
 			if err := c.handleCmd(m); err != nil {
 				q.rmConn(c)
 				_ = c.Close()
+				c.SetClosed()
 				return Msg{err: err}, err
 			}
 			continue
