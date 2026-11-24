@@ -15,7 +15,11 @@ import (
 // The returned socket value is initially unbound.
 func NewSub(ctx context.Context, opts ...Option) Socket {
 	sub := &subSocket{sck: newSocket(ctx, Sub, opts...)}
-	sub.sck.r = newQReader(sub.sck.ctx)
+	if sub.sck.inlineRecv {
+		sub.sck.r = newInlineReader(sub.sck.ctx)
+	} else {
+		sub.sck.r = newQReader(sub.sck.ctx)
+	}
 	sub.sck.subTopics = sub.Topics
 	sub.topics = make(map[string]struct{})
 	return sub

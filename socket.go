@@ -40,6 +40,7 @@ type socket struct {
 	log           *log.Logger
 	subTopics     func() []string
 	autoReconnect bool
+	inlineRecv    bool
 	timeout       time.Duration
 
 	mu    sync.RWMutex
@@ -170,10 +171,8 @@ func (sck *socket) SendMulti(msg Msg) error {
 
 // Recv receives a complete message.
 func (sck *socket) Recv() (Msg, error) {
-	ctx, cancel := context.WithCancel(sck.ctx)
-	defer cancel()
 	var msg Msg
-	err := sck.r.read(ctx, &msg)
+	err := sck.r.read(sck.ctx, &msg)
 	return msg, err
 }
 
@@ -257,7 +256,12 @@ connect:
 		// retry if retry count is lower than maximum retry count and context has not been canceled
 		if (sck.maxRetries == -1 || retries < sck.maxRetries) && sck.ctx.Err() == nil {
 			retries++
-			time.Sleep(sck.retry)
+			t := time.NewTimer(sck.retry)
+			select {
+			case <-sck.ctx.Done():
+				t.Stop()
+			case <-t.C:
+			}
 			goto connect
 		}
 		return fmt.Errorf("zmq4: could not dial to %q (retry=%v): %w", endpoint, sck.retry, err)

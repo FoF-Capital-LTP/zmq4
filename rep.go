@@ -167,7 +167,11 @@ func (r *repReader) listen(ctx context.Context, conn *Conn) {
 			if msg.err != nil {
 				return
 			}
-			r.msgCh <- repMsg{conn, msg}
+			select {
+			case r.msgCh <- repMsg{conn, msg}:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }

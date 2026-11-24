@@ -66,6 +66,21 @@ func WithDialerMaxRetries(maxRetries int) Option {
 	}
 }
 
+// WithInlineRecv configures a SUB socket to read messages directly in the
+// goroutine calling Recv, instead of through a per-connection reader goroutine
+// and a channel. This removes one goroutine hand-off per message (lower
+// latency and CPU) and leaves no goroutine behind on Close.
+//
+// The socket must be connected to a single endpoint and Recv must be called
+// from one goroutine at a time. A new connection (for example after an
+// automatic reconnect) replaces the previous one. ZMTP commands are handled
+// internally and never returned by Recv.
+func WithInlineRecv() Option {
+	return func(s *socket) {
+		s.inlineRecv = true
+	}
+}
+
 // WithAutomaticReconnect allows to configure a socket to automatically
 // reconnect on connection loss.
 func WithAutomaticReconnect(automaticReconnect bool) Option {

@@ -167,7 +167,11 @@ func (q *routerQReader) listen(ctx context.Context, r *Conn) {
 				return
 			}
 			msg.Frames = append([][]byte{id}, msg.Frames...)
-			q.c <- msg
+			select {
+			case q.c <- msg:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }

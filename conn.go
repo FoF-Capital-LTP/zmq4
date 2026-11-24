@@ -5,6 +5,7 @@
 package zmq4
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"errors"
@@ -18,12 +19,25 @@ import (
 
 var ErrClosedConn = errors.New("zmq4: read/write on closed connection")
 
+// connReadBufSize is the size of the per-connection read buffer.
+const connReadBufSize = 32 << 10
+
+// reader returns the buffered reader of the connection.
+// Conns built without Open (tests) fall back to the raw connection.
+func (c *Conn) reader() io.Reader {
+	if c.r != nil {
+		return c.r
+	}
+	return c.rw
+}
+
 // Conn implements the ZeroMQ Message Transport Protocol as defined
 // in https://rfc.zeromq.org/spec:23/ZMTP/.
 type Conn struct {
 	typ    SocketType
 	id     SocketIdentity
 	rw     net.Conn
+	r      *bufio.Reader // all reads go through r, so one syscall can fetch many frames
 	sec    Security
 	Server bool
 	Meta   Metadata
@@ -47,7 +61,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 	if c.Closed() {
 		return 0, ErrClosedConn
 	}
-	n, err := io.ReadFull(c.rw, p)
+	n, err := io.ReadFull(c.reader(), p)
 	c.checkIO(err)
 	return n, err
 }
@@ -77,6 +91,7 @@ func Open(rw net.Conn, sec Security, sockType SocketType, sockID SocketIdentity,
 		typ:            sockType,
 		id:             sockID,
 		rw:             rw,
+		r:              bufio.NewReaderSize(rw, connReadBufSize),
 		sec:            sec,
 		Server:         server,
 		Meta:           make(Metadata),
@@ -140,7 +155,7 @@ func (conn *Conn) greet(server bool) error {
 	}
 
 	var recv greeting
-	err = recv.read(conn.rw)
+	err = recv.read(conn.reader())
 	if err != nil {
 		conn.checkIO(err)
 		return fmt.Errorf("zmq4: could not recv greeting: %w", err)
@@ -380,7 +395,7 @@ func (c *Conn) read() Msg {
 	for hasMore {
 
 		// Read out the header
-		_, msg.err = io.ReadFull(c.rw, header[:])
+		_, msg.err = io.ReadFull(c.reader(), header[:])
 		if msg.err != nil {
 			c.checkIO(msg.err)
 			return msg
@@ -399,7 +414,7 @@ func (c *Conn) read() Msg {
 			// We already have the first byte, so assign it, and then read the rest
 			longHdr[0] = header[1]
 
-			_, msg.err = io.ReadFull(c.rw, longHdr[1:])
+			_, msg.err = io.ReadFull(c.reader(), longHdr[1:])
 			if msg.err != nil {
 				c.checkIO(msg.err)
 				return msg
@@ -414,7 +429,7 @@ func (c *Conn) read() Msg {
 		}
 
 		body := make([]byte, size)
-		_, msg.err = io.ReadFull(c.rw, body)
+		_, msg.err = io.ReadFull(c.reader(), body)
 		if msg.err != nil {
 			c.checkIO(msg.err)
 			return msg
