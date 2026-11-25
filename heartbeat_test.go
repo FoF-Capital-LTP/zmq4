@@ -214,3 +214,38 @@ func TestHeartbeatKeepsReceiveOnlyPeer(t *testing.T) {
 		t.Fatal("nothing received after idle period")
 	}
 }
+
+// PINGs carry no TTL, as libzmq sends by default: libzmq peers drop the
+// connection when nothing follows a PING within its TTL, and with the TTL equal
+// to the interval an idle connection raced the next PING and was dropped.
+func TestHeartbeatPingHasNoTTL(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ep := must(EndPoint("tcp"))
+	r := NewRouter(ctx, WithHeartbeat(10*time.Millisecond, 30*time.Second))
+	defer r.Close()
+	if err := r.Listen(ep); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := net.Dial("tcp", ep[len("tcp://"):])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	zc, err := Open(raw, nullSecurity{}, Dealer, SocketIdentity("peer"), false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = raw.SetReadDeadline(time.Now().Add(5 * time.Second))
+	m := zc.read()
+	if m.err != nil {
+		t.Fatal(m.err)
+	}
+	var cmd Cmd
+	if !m.isCmd() || cmd.unmarshalZMTP(m.Frames[0]) != nil || cmd.Name != CmdPing {
+		t.Fatalf("expected a PING, got %+v", m)
+	}
+	if len(cmd.Body) < 2 || cmd.Body[0] != 0 || cmd.Body[1] != 0 {
+		t.Fatalf("PING TTL = %v, want 0", cmd.Body)
+	}
+}

@@ -373,12 +373,12 @@ func (sck *socket) openConn(conn net.Conn, server bool) (*Conn, error) {
 func (sck *socket) heartbeat(c *Conn) {
 	t := time.NewTicker(sck.hbIvl)
 	defer t.Stop()
-	// ZMTP 3.1 PING body: TTL in deciseconds, then an empty context.
-	ttl := sck.hbTimeout / (100 * time.Millisecond)
-	if ttl > 0xffff {
-		ttl = 0xffff
-	}
-	ping := []byte{byte(ttl >> 8), byte(ttl)}
+	// ZMTP 3.1 PING body: a TTL in deciseconds, then an empty context. The TTL
+	// asks the peer to drop the connection if nothing follows within it; libzmq
+	// leaves it at 0 unless ZMQ_HEARTBEAT_TTL is set, and so do we. Sending our
+	// timeout there made libzmq peers race the next PING (interval == timeout) and
+	// drop idle connections; each side detects a dead peer with its own heartbeat.
+	ping := []byte{0, 0}
 	// The timeout runs from the first PING sent after the last frame received, as
 	// in libzmq: a peer that only receives, and so never sends on its own, stays up
 	// as long as it answers PINGs.
