@@ -642,8 +642,9 @@ func (c *Conn) sendBatch(msgs []Msg) error {
 		}
 	}
 	c.batchBufs = bufs // WriteTo consumes its receiver; keep the backing array
+	used := len(bufs)
 	_, err := bufs.WriteTo(c.rw)
-	clear(c.batchBufs[:cap(c.batchBufs)]) // do not pin sent messages
+	clear(c.batchBufs[:used]) // do not pin sent messages
 	if err != nil {
 		c.checkIO(err)
 	}

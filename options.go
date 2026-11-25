@@ -129,6 +129,22 @@ func WithHeartbeat(ivl, timeout time.Duration) Option {
 	}
 }
 
+// WithPubIOLoops makes a PUB (or XPUB) write for its subscribers from n
+// goroutines, each sweeping its share of them with non-blocking writes, like
+// libzmq's I/O threads: one wakeup per batch instead of one per subscriber, and
+// under load each write carries more messages, which cuts CPU at high fan-out.
+// A subscriber whose socket is full is finished by its own goroutine, so it never
+// holds up the others. Linux TCP and IPC only; other subscribers (inproc,
+// non-NULL security, other systems) keep a goroutine each, as with n = 0, the
+// default.
+func WithPubIOLoops(n int) Option {
+	return func(s *socket) {
+		if n > 0 {
+			s.pubIOLoops = n
+		}
+	}
+}
+
 // WithRouterMandatory makes a ROUTER's Send fail with ErrHostUnreachable when no
 // peer has the identity, and with ErrQueueFull when that peer's queue is full,
 // instead of dropping the message (ZMQ_ROUTER_MANDATORY).

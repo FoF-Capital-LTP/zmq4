@@ -33,7 +33,7 @@ func queued(p *pubPeer) (out []string) {
 }
 
 func TestPubIndexMatching(t *testing.T) {
-	mw := newPubMWriter(context.Background())
+	mw := newPubMWriter(context.Background(), 0)
 	p := stuckPeer(mw, subscribedConn("ab", "xyz"))
 	msgs := []string{"ab", "abc", "xyz1", "a", "xy", "b", ""}
 	for _, m := range msgs {
@@ -94,7 +94,7 @@ func stuckPeer(mw *pubMWriter, c *Conn) *pubPeer {
 // TestPubHWMCountsOnlySubscribed: messages the peer did not subscribe to must not
 // take room in its queue, or unrelated traffic makes a slow peer drop its own.
 func TestPubHWMCountsOnlySubscribed(t *testing.T) {
-	mw := newPubMWriter(context.Background())
+	mw := newPubMWriter(context.Background(), 0)
 	mw.hwm.Store(10)
 	p := stuckPeer(mw, subscribedConn("mine"))
 	for i := 0; i < 1000; i++ {
@@ -117,7 +117,7 @@ func TestPubHWMCountsOnlySubscribed(t *testing.T) {
 // A peer subscribed to several prefixes of a topic gets the message once, and a
 // batch wakes each peer once.
 func TestPubWriteBatchDedupAndWake(t *testing.T) {
-	mw := newPubMWriter(context.Background())
+	mw := newPubMWriter(context.Background(), 0)
 	a := stuckPeer(mw, subscribedConn("a", "ab", "abc"))
 	b := stuckPeer(mw, subscribedConn("x"))
 	all := stuckPeer(mw, subscribedConn(""))
@@ -156,10 +156,16 @@ func TestPubWriteBatchDedupAndWake(t *testing.T) {
 // TestPubBatchedDelivery: batched writes keep every subscribed message, in order
 // and intact, across short, long and multipart frames.
 func TestPubBatchedDelivery(t *testing.T) {
+	for _, loops := range []int{0, 1, 3} {
+		t.Run(fmt.Sprintf("io-loops=%d", loops), func(t *testing.T) { testPubBatchedDelivery(t, loops) })
+	}
+}
+
+func testPubBatchedDelivery(t *testing.T, loops int) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	ep := must(EndPoint("tcp"))
-	pub := NewPub(ctx)
+	pub := NewPub(ctx, WithPubIOLoops(loops))
 	defer pub.Close()
 	if err := pub.Listen(ep); err != nil {
 		t.Fatal(err)
@@ -224,7 +230,7 @@ wait:
 // Concurrent senders: a peer matching through several prefixes still gets each
 // message exactly once.
 func TestPubConcurrentWriteBatchNoDuplicates(t *testing.T) {
-	mw := newPubMWriter(context.Background())
+	mw := newPubMWriter(context.Background(), 0)
 	mw.hwm.Store(1 << 30)
 	p := stuckPeer(mw, subscribedConn("", "a", "ab"))
 	const senders, each = 4, 5000
@@ -247,7 +253,7 @@ func TestPubConcurrentWriteBatchNoDuplicates(t *testing.T) {
 // Many subscribers reconnecting with many topics each: subscriptions must be
 // indexed in time linear in their number, not quadratic.
 func TestPubSubscriptionStorm(t *testing.T) {
-	mw := newPubMWriter(context.Background())
+	mw := newPubMWriter(context.Background(), 0)
 	const peers, topics = 200, 300
 	start := time.Now()
 	for i := 0; i < peers; i++ {

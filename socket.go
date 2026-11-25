@@ -54,6 +54,7 @@ type socket struct {
 	maxRecvFrame     uint64
 	recvBufSize      int // SO_RCVBUF of new connections, 0 = OS default
 	sendBufSize      int // SO_SNDBUF of new connections, 0 = OS default
+	pubIOLoops       int // PUB/XPUB: goroutines writing for the subscribers (WithPubIOLoops)
 	routerMandatory  bool
 	routerHandover   bool
 	hbIvl            time.Duration // PING interval, 0 = no heartbeat

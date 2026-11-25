@@ -27,7 +27,7 @@ type Topics interface {
 // The returned socket value is initially unbound.
 func NewPub(ctx context.Context, opts ...Option) Socket {
 	pub := &pubSocket{sck: newSocket(ctx, Pub, opts...)}
-	w, r := newPubMWriter(pub.sck.ctx), newPubQReader(pub.sck.ctx)
+	w, r := newPubMWriter(pub.sck.ctx, pub.sck.pubIOLoops), newPubQReader(pub.sck.ctx)
 	r.onSubscribe = w.subscribed
 	pub.sck.w, pub.sck.r = w, r
 	return pub
@@ -241,6 +241,12 @@ func (q *pubQReader) topic(msg Msg) bool {
 // pubPeer is one subscriber connection of a PUB.
 type pubPeer struct {
 	*connQueue
+	// With a loop, the queue is written by that loop (see pubLoop) instead of
+	// the connQueue's own goroutine.
+	loop     *pubLoop
+	nb       *nbWriter
+	inReady  atomic.Bool   // on loop's ready list
+	slow     atomic.Bool   // catchUp is writing; the loop leaves the peer alone
 	lastMsg  atomic.Uint64 // last message enqueued: a peer matching through several prefixes gets it once
 	lastCall atomic.Uint64 // last write call that enqueued here: wake each peer once per call
 }
@@ -304,13 +310,24 @@ type pubMWriter struct {
 	sendMu sync.Mutex
 	seq    uint64 // message and call stamps, under sendMu
 	hwm    atomic.Int64
+
+	loops    []*pubLoop // nil: every peer has its own writer goroutine
+	nextLoop int
 }
 
-func newPubMWriter(ctx context.Context) *pubMWriter {
+func newPubMWriter(ctx context.Context, ioLoops int) *pubMWriter {
 	p := &pubMWriter{
 		ctx:   ctx,
 		peers: map[*Conn]*pubPeer{},
 		index: newPubIndex(),
+	}
+	if n := ioLoops; n > 0 {
+		for i := 0; i < n; i++ {
+			l := newPubLoop()
+			p.loops = append(p.loops, l)
+			context.AfterFunc(ctx, l.stop)
+			go l.run()
+		}
 	}
 	p.hwm.Store(DefaultSendHwm)
 	return p
@@ -338,9 +355,17 @@ func (w *pubMWriter) addConn(c *Conn) {
 		_ = c.Close()
 		return
 	}
+	if len(w.loops) > 0 {
+		if p.nb = newNBWriter(c); p.nb != nil {
+			p.loop = w.loops[w.nextLoop%len(w.loops)]
+			w.nextLoop++
+		}
+	}
 	w.peers[c] = p // no subscriptions yet: they arrive through subscribed
 	w.mu.Unlock()
-	go p.run()
+	if p.loop == nil {
+		go p.run()
+	}
 }
 
 func (w *pubMWriter) rmConn(c *Conn) {
@@ -422,8 +447,20 @@ func (w *pubMWriter) writeBatch(ctx context.Context, msgs []Msg) error {
 			}
 		}
 	}
+	var loopsBuf [8]*pubLoop
+	loops := loopsBuf[:0]
 	for _, p := range touched {
-		p.signal()
+		if p.loop == nil {
+			p.signal()
+			continue
+		}
+		p.loop.enqueue(p)
+		if !slices.Contains(loops, p.loop) {
+			loops = append(loops, p.loop)
+		}
+	}
+	for _, l := range loops {
+		l.signal()
 	}
 	return nil
 }

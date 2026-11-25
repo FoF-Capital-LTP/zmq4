@@ -19,6 +19,7 @@ func TestCloseStopsPeerWriters(t *testing.T) {
 		peer func(context.Context) Socket
 	}{
 		{"pub", func(ctx context.Context) Socket { return NewPub(ctx) }, func(ctx context.Context) Socket { return NewSub(ctx, WithInlineRecv()) }},
+		{"pub-io-loops", func(ctx context.Context) Socket { return NewPub(ctx, WithPubIOLoops(2)) }, func(ctx context.Context) Socket { return NewSub(ctx, WithInlineRecv()) }},
 		{"router", func(ctx context.Context) Socket { return NewRouter(ctx) }, func(ctx context.Context) Socket { return NewDealer(ctx, WithInlineRecv()) }},
 	} {
 		t.Run(mk.name, func(t *testing.T) {
