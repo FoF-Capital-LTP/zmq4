@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -141,4 +142,93 @@ func TestPubLoopSlowSubscriber(t *testing.T) {
 		t.Fatalf("frozen subscriber got only %d messages", count)
 	}
 	t.Logf("frozen subscriber got %d messages, last %d", count, last)
+}
+
+func pongRacePayload(seq uint64, n int) []byte {
+	b := make([]byte, n)
+	b[0] = 'T'
+	binary.LittleEndian.PutUint64(b[1:], seq)
+	for i := 9; i < n; i++ {
+		b[i] = byte(seq*31 + uint64(i))
+	}
+	return b
+}
+
+// A write that stops mid-frame must keep the connection's write lock until the
+// frame is finished: otherwise the reader's PONG (for a subscriber's PING) lands
+// inside the frame and the subscriber reads a message with altered content.
+func TestPubLoopPartialWriteKeepsFrameWhole(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ep := must(EndPoint("tcp"))
+	pub := NewPub(ctx, WithPubIOLoops(1), WithSendBufferSize(4096))
+	defer pub.Close()
+	if err := pub.Listen(ep); err != nil {
+		t.Fatal(err)
+	}
+	sub := NewSub(ctx, WithInlineRecv(), WithHeartbeat(2*time.Millisecond, 30*time.Second))
+	defer sub.Close()
+	_ = sub.SetOption(OptionSubscribe, "")
+	if err := sub.Dial(ep); err != nil {
+		t.Fatal(err)
+	}
+	w := pub.(*pubSocket).sck.w.(*pubMWriter)
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		w.mu.RLock()
+		n := len(w.index.peers[""])
+		w.mu.RUnlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("subscription never registered")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	errc := make(chan error, 1)
+	var received atomic.Int64
+	go func() {
+		for {
+			m, err := sub.Recv()
+			if err != nil {
+				errc <- nil
+				return
+			}
+			b := m.Frames[0]
+			if len(b) < 9 || b[0] != 'T' {
+				errc <- fmt.Errorf("bad message head, len %d", len(b))
+				return
+			}
+			seq := binary.LittleEndian.Uint64(b[1:])
+			for i := 9; i < len(b); i++ {
+				if b[i] != byte(seq*31+uint64(i)) {
+					errc <- fmt.Errorf("message %d corrupt at byte %d of %d", seq, i, len(b))
+					return
+				}
+			}
+			received.Add(1)
+		}
+	}()
+	var seq uint64
+	end := time.Now().Add(3 * time.Second)
+	for time.Now().Before(end) {
+		batch := make([]Msg, 0, 64)
+		for i := 0; i < 64; i++ {
+			seq++
+			batch = append(batch, NewMsg(pongRacePayload(seq, 2000+int(seq%2000))))
+		}
+		if err := pub.(*pubSocket).SendBatch(batch); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-errc:
+			t.Fatal(err)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if received.Load() == 0 {
+		t.Fatal("nothing received")
+	}
+	t.Logf("%d messages checked", received.Load())
 }

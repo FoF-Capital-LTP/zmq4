@@ -98,13 +98,20 @@ func (p *pubPeer) flush() {
 	p.mu.Unlock()
 	c := p.conn
 	var rest net.Buffers
+	locked := false // the write lock goes to catchUp with rest
 	if c.wmu.TryLock() {
 		var err error
 		rest, err = p.nb.write(msgs)
-		c.wmu.Unlock()
 		if err != nil {
 			c.checkIO(err)
 			rest = nil // the connection is gone; the reader's error removes the peer
+		}
+		if len(rest) == 0 {
+			c.wmu.Unlock()
+		} else {
+			// rest can start in the middle of a frame: keep the lock until catchUp
+			// has finished it, or a PONG or PING would land inside the frame.
+			locked = true
 		}
 	} else {
 		rest = frameBuffers(msgs) // a command is being written: let the slow path wait for it
@@ -115,15 +122,19 @@ func (p *pubPeer) flush() {
 	p.mu.Unlock()
 	if len(rest) > 0 {
 		p.slow.Store(true)
-		go p.catchUp(rest)
+		go p.catchUp(rest, locked)
 	}
 }
 
 // catchUp finishes a write that would have blocked, then keeps writing p's
 // queue with blocking writes until it is empty, and hands p back to its loop.
-func (p *pubPeer) catchUp(rest net.Buffers) {
+// locked says flush handed over the connection's write lock (rest then ends a
+// frame flush started); otherwise rest is whole frames and catchUp takes it.
+func (p *pubPeer) catchUp(rest net.Buffers, locked bool) {
 	c := p.conn
-	c.wmu.Lock()
+	if !locked {
+		c.wmu.Lock()
+	}
 	_, err := rest.WriteTo(c.rw)
 	c.wmu.Unlock()
 	if err != nil {
